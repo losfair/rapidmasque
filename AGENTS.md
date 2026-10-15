@@ -58,6 +58,20 @@ and documented in `README.md`.
   the lowest-numbered usable path (multipath = failover); BBRv3 spills over
   across paths (aggregation).
 
+## Release Builds
+
+- Linux musl: native static build in Alpine with Alpine's Rust
+  (`.github/scripts/build-musl.sh`); rustup's musl toolchain links build
+  scripts statically and breaks bindgen.
+- OpenBSD: cross-built from Linux (`.github/scripts/cross-openbsd.sh`), then
+  run in OpenBSD VMs (`smoke-test.sh`). Gotchas it encodes: tier-3 target
+  (nightly `-Zbuild-std`, pinned in CI); unversioned `.so` symlinks in the
+  sysroot; `-z nobtcfi` via rust-lld; clang >= 22 (older LLVM crashes on
+  aarch64-openbsd stack-protector code); a forced `<pthread.h>` include for
+  boring-sys 4's BoringSSL (the native OpenBSD build fails the same way).
+- `src/openbsd_arm64.rs` supplies BoringSSL's missing `OPENSSL_cpuid_setup`
+  for OpenBSD/aarch64 (reads `machdep.id_aa64isar0`).
+
 ## Coding Style & Naming Conventions
 
 - Follow standard Rust style; `snake_case` for functions/vars, `CamelCase` for

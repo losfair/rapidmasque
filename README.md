@@ -51,10 +51,18 @@ Prebuilt binaries are attached to each [GitHub release](https://github.com/losfa
 | OpenBSD amd64 | `rapidmasque-x86_64-unknown-openbsd.tar.gz` |
 | OpenBSD arm64 | `rapidmasque-aarch64-unknown-openbsd.tar.gz` |
 
-The Linux binaries are fully static and run on any distribution. CI builds every
-target natively: Linux inside Alpine (`.github/scripts/build-musl.sh`), OpenBSD
-7.9 in a VM (`.github/scripts/build-openbsd.sh`); `SHA256SUMS` covers all
-archives.
+The Linux binaries are fully static and run on any distribution; they are built
+natively inside Alpine (`.github/scripts/build-musl.sh`). The OpenBSD 7.9
+binaries are cross-built on Linux (`.github/scripts/cross-openbsd.sh`: nightly
+Rust with `-Zbuild-std`, the official OpenBSD sysroot sets, clang/lld) and then
+smoke-tested in OpenBSD VMs (`.github/scripts/smoke-test.sh`). `SHA256SUMS`
+covers all archives.
+
+To cross-build OpenBSD locally (needs clang >= 22, cmake, Go, rustup):
+
+```
+CLANG=clang-22 CLANGXX=clang++-22 .github/scripts/cross-openbsd.sh arm64 out/rapidmasque
+```
 
 ## Model
 

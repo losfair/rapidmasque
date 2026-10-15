@@ -135,12 +135,87 @@ jobs:
           name: rapidmasque-aarch64-apple-darwin
           path: dist/*
 
+  # OpenBSD is cross-built on Linux (`.github/scripts/cross-openbsd.sh`):
+  # nightly -Zbuild-std + the official OpenBSD sysroot + clang/lld. A VM per
+  # arch then runs the result (test-openbsd); compiling inside an emulated
+  # arm64 VM would take hours.
   build-openbsd:
     name: build (${{ matrix.label }})
-    # cross-platform-actions ships an x86-64-only QEMU, so both VMs run on
-    # x86-64 runners: amd64 is KVM-accelerated, arm64 is fully emulated (slow).
     runs-on: ubuntu-24.04
-    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: x86_64-unknown-openbsd
+            arch: amd64
+          - label: aarch64-unknown-openbsd
+            arch: arm64
+    env:
+      OPENBSD_VERSION: "7.9"
+      RUST_NIGHTLY: nightly-2026-10-15
+      # LLVM < 22 crashes on stack-protector code for aarch64-unknown-openbsd.
+      CLANG: clang-22
+      CLANGXX: clang++-22
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang 22 (apt.llvm.org)
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-22.list
+          sudo apt-get update
+          sudo apt-get install -y clang-22 cmake
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Cache OpenBSD sysroot
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/openbsd-sysroot
+          key: openbsd-sysroot-${{ env.OPENBSD_VERSION }}-${{ matrix.arch }}-v1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.label }}
+
+      - name: Cross-build
+        run: .github/scripts/cross-openbsd.sh ${{ matrix.arch }} out/rapidmasque
+
+      - name: Build smoke-test helpers for OpenBSD
+        env:
+          GOOS: openbsd
+          GOARCH: ${{ matrix.arch }}
+          GO111MODULE: "off"
+        run: |
+          for t in udpecho udpsend gencert; do
+            go build -o "out/tools/$t" "testing/$t.go"
+          done
+
+      - name: Package
+        run: .github/scripts/package.sh out/rapidmasque ${{ matrix.label }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rapidmasque-${{ matrix.label }}
+          path: dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smoke-${{ matrix.label }}
+          path: out/
+
+  test-openbsd:
+    name: run on OpenBSD (${{ matrix.label }})
+    needs: build-openbsd
+    # cross-platform-actions ships an x86-64-only QEMU, so both VMs run on
+    # x86-64 runners: amd64 is KVM-accelerated, arm64 is emulated (it only
+    # runs the binary, so that is fine).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -152,31 +227,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: smoke-${{ matrix.label }}
+          path: out
+
       - name: Start OpenBSD VM
         uses: cross-platform-actions/action@v1.6.0
         with:
           operating_system: openbsd
           architecture: ${{ matrix.architecture }}
           version: "7.9"
-          memory: 6G
+          memory: 4G
           cpu_count: 4
 
-      - name: Build (inside the VM)
+      - name: Smoke test (inside the VM)
         shell: cpa.sh {0}
-        run: .github/scripts/build-openbsd.sh out/rapidmasque
-
-      - name: Package
-        run: .github/scripts/package.sh out/rapidmasque ${{ matrix.label }}
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rapidmasque-${{ matrix.label }}
-          path: dist/*
+        run: |
+          chmod +x out/rapidmasque out/tools/*
+          .github/scripts/smoke-test.sh out/rapidmasque out/tools
 
   release:
     name: publish GitHub release
     if: github.ref_type == 'tag'
-    needs: [build-test, interop, build-linux-musl, build-darwin, build-openbsd]
+    needs: [build-test, interop, build-linux-musl, build-darwin, build-openbsd, test-openbsd]
     runs-on: ubuntu-latest
     permissions:
       contents: write

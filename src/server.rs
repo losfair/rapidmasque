@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use noq::{Connection, Endpoint, Incoming, RecvStream, SendStream};
@@ -446,11 +446,11 @@ fn bind_target_transparent(
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             log::debug!("transparent source {exact} busy; using ephemeral port");
             make(SocketAddr::new(src_ip, 0)).map_err(|e| {
-                anyhow!("transparent bind to {src_ip} failed: {e} (needs CAP_NET_ADMIN)")
+                anyhow::anyhow!("transparent bind to {src_ip} failed: {e} (needs CAP_NET_ADMIN)")
             })?
         }
         Err(e) => {
-            return Err(anyhow!(
+            return Err(anyhow::anyhow!(
                 "transparent bind to {exact} failed: {e} (transparent rules need CAP_NET_ADMIN)"
             ));
         }

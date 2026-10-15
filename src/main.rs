@@ -9,6 +9,8 @@ mod ech;
 mod ech_test;
 mod endpoint;
 mod h3;
+#[cfg(all(target_os = "openbsd", target_arch = "aarch64"))]
+mod openbsd_arm64;
 mod qpack;
 mod qpack_tables;
 mod quic;
