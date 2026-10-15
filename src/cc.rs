@@ -37,10 +37,19 @@ pub enum CongestionControl {
 }
 
 impl CongestionControl {
-    pub(crate) fn factory(self) -> Arc<dyn ControllerFactory + Send + Sync> {
+    /// The controller factory. `bbr3_initial_window` (bytes) is BBRv3's
+    /// initial congestion window, per path.
+    pub(crate) fn factory(
+        self,
+        bbr3_initial_window: u64,
+    ) -> Arc<dyn ControllerFactory + Send + Sync> {
         match self {
             Self::None => Arc::new(NoCongestionControl),
-            Self::Bbr3 => Arc::new(Bbr3Config::default()),
+            Self::Bbr3 => {
+                let mut config = Bbr3Config::default();
+                config.initial_window(bbr3_initial_window);
+                Arc::new(config)
+            }
         }
     }
 }
@@ -84,5 +93,18 @@ impl Controller for NoCongestionControl {
 impl ControllerFactory for NoCongestionControl {
     fn build(self: Arc<Self>, _now: Instant, _current_mtu: u16) -> Box<dyn Controller> {
         Box::new(NoCongestionControl)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bbr3_initial_window_is_configurable() {
+        let now = Instant::now();
+        let custom = CongestionControl::Bbr3.factory(100_000).build(now, 1200);
+        assert_eq!(custom.initial_window(), 100_000);
+        assert_eq!(custom.window(), 100_000);
     }
 }

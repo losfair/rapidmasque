@@ -6,6 +6,10 @@ use clap::{Parser, Subcommand};
 use crate::cc::CongestionControl;
 use crate::client::PathSpec;
 use crate::quic::DEFAULT_PATH_SPILL_THRESHOLD;
+
+/// Smallest `--bbr3-initial-window`: two QUIC minimum-size (1200-byte)
+/// packets.
+const MIN_BBR3_INITIAL_WINDOW: u64 = 2 * 1200;
 use crate::ranking::PathRanking;
 
 #[derive(Parser, Debug)]
@@ -57,6 +61,15 @@ pub struct ServeArgs {
     /// WireGuard) to avoid double congestion control.
     #[arg(long, value_enum, default_value_t = CongestionControl::Bbr3)]
     pub congestion_control: CongestionControl,
+
+    /// BBRv3 initial congestion window in bytes, for every path this side
+    /// sends on [default: 65536, ~48 full-size packets; noq's own is 12000].
+    /// A larger window lets a new path ramp up faster on a high
+    /// bandwidth-delay path (BBRv3 paces it out rather than bursting), at
+    /// the cost of overshooting slow low-RTT links at path start. At least
+    /// 2400. Only with `--congestion-control bbr3`.
+    #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(MIN_BBR3_INITIAL_WINDOW..))]
+    pub bbr3_initial_window: Option<u64>,
 
     /// Queueing delay (milliseconds) accepted on a preferred path before
     /// traffic spills onto less preferred ones (paths with a higher
@@ -157,6 +170,15 @@ pub struct ClientArgs {
     #[arg(long, value_enum, default_value_t = CongestionControl::Bbr3)]
     pub congestion_control: CongestionControl,
 
+    /// BBRv3 initial congestion window in bytes, for every path this side
+    /// sends on [default: 65536, ~48 full-size packets; noq's own is 12000].
+    /// A larger window lets a new path ramp up faster on a high
+    /// bandwidth-delay path (BBRv3 paces it out rather than bursting), at
+    /// the cost of overshooting slow low-RTT links at path start. At least
+    /// 2400. Only with `--congestion-control bbr3`.
+    #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(MIN_BBR3_INITIAL_WINDOW..))]
+    pub bbr3_initial_window: Option<u64>,
+
     /// Queueing delay (milliseconds) accepted on a preferred path before
     /// traffic spills onto less preferred ones (paths with a higher
     /// `/priority=N`). While the preferred path can send everything queued
@@ -206,6 +228,26 @@ mod tests {
         assert_eq!(args.congestion_control, CongestionControl::Bbr3);
         assert_eq!(args.path_spill_threshold_ms, 10);
         assert_eq!(args.rtable, None);
+        assert_eq!(args.bbr3_initial_window, None);
+        let parse = |window: &str| {
+            Cli::try_parse_from([
+                "rapidmasque",
+                "serve",
+                "--rules",
+                "r.json",
+                "--cert",
+                "c.pem",
+                "--key",
+                "k.pem",
+                "--bbr3-initial-window",
+                window,
+            ])
+        };
+        let Command::Serve(args) = parse("65536").unwrap().command else {
+            panic!("expected the serve subcommand");
+        };
+        assert_eq!(args.bbr3_initial_window, Some(65536));
+        assert!(parse("1200").is_err());
         assert_eq!(args.stats_listen, None);
     }
 }

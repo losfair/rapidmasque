@@ -563,6 +563,39 @@ async fn routed_path_uses_its_own_socket() {
     );
 }
 
+/// `--bbr3-initial-window` reaches the connection's BBRv3 controllers.
+#[tokio::test(flavor = "multi_thread")]
+async fn bbr3_initial_window_applies_to_connections() {
+    const WINDOW: u64 = 256 * 1024;
+    let fx = Fixture::new("initcwnd");
+    let server = fx.server(HOST);
+    let addr = server.local_addr().unwrap();
+    tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        conn.closed().await;
+    });
+    let config = quic::build_client_config(
+        &Verify::Roots {
+            ca_file: Some(fx.cert.clone()),
+        },
+        None,
+        TransportOptions {
+            bbr3_initial_window: WINDOW,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let client = client_endpoint(false);
+    let conn = client
+        .connect_with(config, addr, HOST)
+        .unwrap()
+        .await
+        .unwrap();
+    // BBRv3 only grows the window from its initial value during startup.
+    let cwnd = conn.path(noq::PathId::ZERO).unwrap().stats().cwnd;
+    assert!(cwnd >= WINDOW, "cwnd {cwnd} below the configured {WINDOW}");
+}
+
 async fn udp_echo() -> SocketAddr {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = sock.local_addr().unwrap();

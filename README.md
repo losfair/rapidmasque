@@ -158,6 +158,14 @@ BBRv3 is model-based, tolerates non-congestive loss and paces, which suits a
 tunnel over a high-RTT, sporadically lossy path far better than a loss-based
 controller like CUBIC.
 
+Each new path starts BBRv3 with a 64 KiB congestion window
+(`--bbr3-initial-window BYTES`, on `serve` and `client`), not noq's default
+12 KB (RFC 9002's ~10 packets): the tunnel is one long-lived connection
+carrying aggregated, mostly unreliable traffic, often over high RTT, and from
+12 KB BBRv3's startup needs about 6 round trips (~1.7 s at 270 ms) to fill a
+20 Mbit/s path while datagrams queue. Startup is paced, so the larger window
+is not sent as one burst; lower it for slow, shallow-buffered links.
+
 When the tunnelled traffic already runs its own congestion control end to end
 (e.g. TCP inside WireGuard inside the tunnel), an outer controller on top
 ("double CC") can fight it: the outer window queues and delays datagrams,

@@ -216,6 +216,8 @@ pub(crate) fn endpoint_config() -> EndpointConfig {
 pub struct TransportOptions {
     /// Outer congestion control for what this side sends.
     pub congestion_control: CongestionControl,
+    /// BBRv3 initial congestion window in bytes, per path.
+    pub bbr3_initial_window: u64,
     /// How long data may queue for a preferred (lower priority value) path
     /// before it spills onto less preferred paths. `None` spills as soon as
     /// the preferred path is held back by its pacer or congestion window.
@@ -226,10 +228,21 @@ impl Default for TransportOptions {
     fn default() -> Self {
         Self {
             congestion_control: CongestionControl::Bbr3,
+            bbr3_initial_window: DEFAULT_BBR3_INITIAL_WINDOW,
             path_spill_threshold: Some(DEFAULT_PATH_SPILL_THRESHOLD),
         }
     }
 }
+
+/// Default for `--bbr3-initial-window`: 64 KiB, ~48 full-size packets.
+///
+/// noq's default (RFC 9002's ~10 packets, 12000 bytes) is sized for short web
+/// connections competing with many others. A tunnel is one long-lived
+/// connection carrying aggregated, mostly unreliable traffic, often over high
+/// RTT: from 12 KB, BBRv3's startup needs ~6 round trips (~1.7 s at 270 ms) to
+/// fill a 20 Mbit/s path, and datagrams queue in noq meanwhile. Startup is
+/// paced, so a larger window does not leave in one burst.
+pub const DEFAULT_BBR3_INITIAL_WINDOW: u64 = 64 * 1024;
 
 /// Default for `--path-spill-threshold-ms`: the extra queueing delay accepted
 /// on a preferred path before traffic spills onto less preferred ones. Only
@@ -250,7 +263,7 @@ fn transport_config(keepalive: bool, opts: TransportOptions) -> Arc<TransportCon
     // non-congestive loss; with multipath, noq runs one instance per path.
     // `none` drops outer congestion control entirely, for payloads that are
     // already congestion-controlled end to end (see `crate::cc`).
-    t.congestion_controller_factory(opts.congestion_control.factory());
+    t.congestion_controller_factory(opts.congestion_control.factory(opts.bbr3_initial_window));
     // Multipath (draft-ietf-quic-multipath): both ends advertise support, so
     // the client may open extra paths (other local interfaces / server
     // addresses) and noq schedules datagrams across them.
