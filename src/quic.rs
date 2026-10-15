@@ -41,21 +41,32 @@ pub(crate) const MAX_PATHS: u32 = 8;
 const DGRAM_SEND_BUFFER: usize = 4 * 1024 * 1024;
 const DGRAM_RECV_BUFFER: usize = 8 * 1024 * 1024;
 
+/// HTTP datagram size for a full-size packet of a 1280-MTU WireGuard tunnel: a
+/// 1280-byte inner packet inside WireGuard is a 1312-byte UDP payload (16B
+/// header + 16B tag), plus our 2B HTTP-datagram prefix (quarter-stream ID +
+/// context ID) = 1314B. It must fit in one QUIC DATAGRAM frame, which cannot
+/// be fragmented.
+pub(crate) const WIREGUARD_1280_DATAGRAM: usize = 1280 + 32 + 2;
+
+/// noq's per-packet bound on DATAGRAM overhead (`Datagrams::max_size`): flags
+/// byte (1) + destination CID (8, noq's default CID length, which every
+/// rapidmasque peer issues) + packet number (4, noq's conservative bound) +
+/// AEAD tag (16) + DATAGRAM frame type and length bound (9). Against a peer
+/// that issues longer CIDs (up to 20 bytes) the room shrinks accordingly.
+const DATAGRAM_OVERHEAD: usize = 1 + 8 + 4 + 16 + 9;
+
 /// Initial and minimum outer (client<->proxy) QUIC packet size, i.e. UDP
-/// payload bytes.
-/// Sized so a full 1280-MTU inner datagram survives the trip from the very
-/// first packet: a 1280-byte IPv6 packet inside WireGuard is a 1312-byte UDP
-/// payload (16B header + 16B tag), plus our 2B HTTP-datagram prefix = 1314B
-/// that must fit in one QUIC DATAGRAM frame (which cannot be fragmented).
-/// noq's default of 1200 leaves only ~1162B, so until DPLPMTUD has probed the
-/// path upward (and indefinitely where probing never succeeds) every such
-/// packet would be dropped. At 1400 (zeromasque's ceiling) ~1362B are
-/// writable. It is also the floor: DPLPMTUD may raise the size (up to 1452)
-/// but its black-hole detection never lowers it below this, because shrinking
-/// would silently stop the tunnel from carrying full-size inner packets. The
-/// client<->proxy path must therefore carry ~1450-byte IP packets; on a path
-/// that cannot, large packets are lost rather than the tunnel narrowing.
-const INITIAL_MTU: u16 = 1400;
+/// payload bytes: exactly what a 1280-MTU WireGuard packet needs (1352).
+/// noq's default of 1200 leaves only 1162B, so until DPLPMTUD had probed the
+/// path upward (and indefinitely where probing never succeeds) every
+/// full-size packet would be dropped. It is also the floor: DPLPMTUD may raise
+/// the size (up to 1452) but its black-hole detection never lowers it below
+/// this, because shrinking would silently stop the tunnel from carrying
+/// full-size inner packets. The client<->proxy path must therefore carry
+/// 1380-byte IPv4 / 1400-byte IPv6 packets; on a path that cannot, large
+/// packets are lost rather than the tunnel narrowing.
+const INITIAL_MTU: u16 = (WIREGUARD_1280_DATAGRAM + DATAGRAM_OVERHEAD) as u16;
+const _: () = assert!(INITIAL_MTU == 1352);
 
 /// Size requested (per direction) for every UDP socket's kernel buffers.
 ///
