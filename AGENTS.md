@@ -55,8 +55,15 @@ and documented in `README.md`.
   payloads (TCP inside WireGuard), to avoid double CC. noq checks the window
   per packet, so there is no per-frame (datagram-only) exemption, and noq is
   not patched for one. With `none`, noq's path scheduler keeps all traffic on
-  the lowest-numbered usable path (multipath = failover); BBRv3 spills over
+  the most preferred usable path (multipath = failover); BBRv3 spills over
   across paths (aggregation).
+- noq (and noq-proto) come from the losfair/noq fork, pinned by git commit, for
+  per-path scheduling priority (`Path::set_priority`, lower is preferred) and
+  `TransportConfig::path_spill_threshold`. Priorities are local to each end:
+  the client sets them from `--path .../priority=N` / `--primary-priority` and
+  announces them to the server with the `FRAME_PATH_PRIORITY` extension frame
+  on its HTTP/3 control stream (`src/h3.rs`); the server applies them to its
+  side of each path. Keep both noq crates on the same commit.
 
 ## Release Builds
 

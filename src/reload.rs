@@ -15,7 +15,6 @@ use anyhow::{Context, Result};
 use noq::Endpoint;
 use tokio::signal::unix::{SignalKind, signal};
 
-use crate::cc::CongestionControl;
 use crate::ech::key::EchKeySet;
 use crate::quic;
 use crate::rules::RuleTable;
@@ -29,7 +28,7 @@ pub struct ReloadPaths {
     pub ech_key: Option<PathBuf>,
     pub rules: PathBuf,
     /// Not a path, but part of what a rebuild needs.
-    pub congestion_control: CongestionControl,
+    pub transport: quic::TransportOptions,
 }
 
 /// Install the SIGHUP handler and spawn the reload task. Returns once the
@@ -68,7 +67,7 @@ fn rebuild(paths: &ReloadPaths) -> Result<(noq::ServerConfig, RuleTable)> {
         &paths.key,
         ech.as_ref(),
         rules.allowed_sni_hosts(),
-        paths.congestion_control,
+        paths.transport,
     )?;
     Ok((config, rules))
 }

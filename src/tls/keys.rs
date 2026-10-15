@@ -309,7 +309,7 @@ impl PacketKey {
         let mut nonce = self.iv;
         for (n, p) in nonce[..4]
             .iter_mut()
-            .zip(path_id_u32(path_id).to_be_bytes())
+            .zip(crate::util::path_id_u32(path_id).to_be_bytes())
         {
             *n ^= p;
         }
@@ -358,19 +358,6 @@ impl crypto::PacketKey for PacketKey {
     fn integrity_limit(&self) -> u64 {
         self.suite.integrity_limit()
     }
-}
-
-/// noq keeps `PathId::as_u32` crate-private; recover the value from its public
-/// varint wire encoding instead.
-fn path_id_u32(path_id: PathId) -> u32 {
-    use noq_proto::coding::Encodable;
-    if path_id == PathId::ZERO {
-        return 0;
-    }
-    let mut buf = [0u8; 8];
-    let mut w = &mut buf[..];
-    path_id.encode(&mut w);
-    crate::varint::decode(&buf).map_or(0, |(v, _)| v as u32)
 }
 
 /// Header protection (RFC 9001 §5.4).

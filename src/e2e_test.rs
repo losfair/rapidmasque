@@ -17,7 +17,8 @@ use crate::client::{self, ConnectParams, PathSpec, ProxyOptions};
 use crate::ech::key::EchKeySet;
 use crate::ech_test::{ech_config_list_and_key_set, self_signed};
 use crate::endpoint::Endpoint as ProxyEndpoint;
-use crate::quic::{self, Verify, WIREGUARD_1280_DATAGRAM};
+use crate::h3;
+use crate::quic::{self, TransportOptions, Verify, WIREGUARD_1280_DATAGRAM};
 use crate::rules::RuleTable;
 use crate::server::{self, ServerState};
 use crate::tls::HandshakeData;
@@ -60,7 +61,7 @@ impl Fixture {
             &self.key,
             Some(&self.ech_keys),
             vec![allowed.to_string()],
-            CongestionControl::Bbr3,
+            transport(CongestionControl::Bbr3),
         )
         .unwrap();
         let socket = quic::bind_endpoint_socket("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -81,7 +82,7 @@ impl Fixture {
         quic::build_client_config(
             &verify,
             ech.then(|| self.ech_list.clone()),
-            CongestionControl::Bbr3,
+            transport(CongestionControl::Bbr3),
         )
         .unwrap()
     }
@@ -90,6 +91,13 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn transport(congestion_control: CongestionControl) -> TransportOptions {
+    TransportOptions {
+        congestion_control,
+        ..Default::default()
     }
 }
 
@@ -244,6 +252,66 @@ async fn multipath_second_path_carries_datagrams() {
     assert!(path.stats().udp_tx.datagrams > 0, "path 1 must have sent");
 }
 
+/// Client path priorities (`--path .../priority=N`, `--primary-priority`)
+/// apply on both ends: locally, and on the proxy through the PATH_PRIORITY
+/// control frame. With an extra path to the same proxy address, the primary
+/// path's maintainer is pinned to the handshake's source address.
+#[tokio::test(flavor = "multi_thread")]
+async fn path_priorities_apply_on_both_ends() {
+    let fx = Fixture::new("priority");
+    let server = fx.server(HOST);
+    let addr = server.local_addr().unwrap();
+    let (server_tx, server_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let _control = h3::open_control(&conn).await.unwrap();
+        tokio::spawn(h3::serve_uni_streams(conn.clone()));
+        let _ = server_tx.send(conn.clone());
+        conn.closed().await;
+    });
+
+    let client = client_endpoint(true);
+    let conn = client
+        .connect_with(fx.client_config(false), addr, HOST)
+        .unwrap()
+        .await
+        .unwrap();
+    let server_conn = server_rx.await.unwrap();
+    let control = h3::open_control(&conn).await.unwrap();
+
+    let extra: PathSpec = format!("{addr}@127.0.0.2/priority=3").parse().unwrap();
+    let primary = client::primary_path_spec(&conn, addr, std::slice::from_ref(&extra), 1).await;
+    assert_eq!(
+        primary.local_ip.map(|ip| ip.to_canonical()),
+        Some("127.0.0.1".parse().unwrap()),
+        "primary path must be pinned to the handshake's source address"
+    );
+    for spec in [primary, extra] {
+        tokio::spawn(client::maintain_path(conn.clone(), spec, control.clone()));
+    }
+
+    // Path 0 (primary) gets priority 1 and the extra path priority 3, on both
+    // ends.
+    let applied = |c: &noq::Connection| {
+        let primary = c.path(noq::PathId::ZERO).and_then(|p| p.priority().ok()) == Some(1);
+        let extra = (1..quic::MAX_PATHS * 4)
+            .filter_map(|id| c.path(noq::PathId::from(id)))
+            .any(|p| p.priority().ok() == Some(3));
+        primary && extra
+    };
+    for _ in 0..100 {
+        if applied(&conn) && applied(&server_conn) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!(
+        "priorities not applied (client: {}, server: {})",
+        applied(&conn),
+        applied(&server_conn)
+    );
+}
+
 async fn udp_echo() -> SocketAddr {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = sock.local_addr().unwrap();
@@ -278,7 +346,7 @@ async fn tunnel_roundtrip_with_ech_and_multipath() {
         &fx.key,
         Some(&fx.ech_keys),
         rules.allowed_sni_hosts(),
-        CongestionControl::None,
+        transport(CongestionControl::None),
     )
     .unwrap();
     let endpoint = Endpoint::new(
@@ -312,7 +380,8 @@ async fn tunnel_roundtrip_with_ech_and_multipath() {
                     .parse::<PathSpec>()
                     .unwrap(),
             ],
-            congestion_control: CongestionControl::None,
+            primary_priority: 0,
+            transport: transport(CongestionControl::None),
         },
         listen,
     };
@@ -346,7 +415,7 @@ async fn no_congestion_control_never_limits_any_path() {
         &fx.key,
         None,
         vec![HOST.to_string()],
-        CongestionControl::None,
+        transport(CongestionControl::None),
     )
     .unwrap();
     let socket = quic::bind_endpoint_socket("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -368,7 +437,8 @@ async fn no_congestion_control_never_limits_any_path() {
     let verify = Verify::Roots {
         ca_file: Some(fx.cert.clone()),
     };
-    let client_config = quic::build_client_config(&verify, None, CongestionControl::None).unwrap();
+    let client_config =
+        quic::build_client_config(&verify, None, transport(CongestionControl::None)).unwrap();
     let client = client_endpoint(true);
     let conn = client
         .connect_with(client_config, addr, HOST)
@@ -447,7 +517,7 @@ async fn idle_extra_path_stays_up_and_fits_wireguard() {
         &fx.key,
         None,
         vec![HOST.to_string()],
-        CongestionControl::Bbr3,
+        transport(CongestionControl::Bbr3),
     )
     .unwrap();
     // Wildcard bind so the server answers on 127.0.0.2 too.

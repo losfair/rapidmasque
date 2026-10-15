@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 
 use crate::cc::CongestionControl;
 use crate::client::PathSpec;
+use crate::quic::DEFAULT_PATH_SPILL_THRESHOLD;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Multipath MASQUE (CONNECT-UDP) proxy and client", long_about = None)]
@@ -55,6 +56,16 @@ pub struct ServeArgs {
     /// WireGuard) to avoid double congestion control.
     #[arg(long, value_enum, default_value_t = CongestionControl::Bbr3)]
     pub congestion_control: CongestionControl,
+
+    /// Queueing delay (milliseconds) accepted on a preferred path before
+    /// traffic spills onto less preferred ones (paths with a higher
+    /// `/priority=N`). While the preferred path can send everything queued
+    /// within this time at its current BBRv3 rate, lower-priority paths carry
+    /// no data. `0` spills whenever the preferred path is momentarily paced,
+    /// which spreads even light traffic over all paths. Has no effect while
+    /// all paths share one priority.
+    #[arg(long, value_name = "MS", default_value_t = DEFAULT_PATH_SPILL_THRESHOLD.as_millis() as u64)]
+    pub path_spill_threshold_ms: u64,
 }
 
 #[derive(Parser, Debug)]
@@ -77,14 +88,23 @@ pub struct ClientArgs {
     #[arg(long, value_name = "IP:PORT")]
     pub proxy_addr: Option<SocketAddr>,
 
-    /// Open an additional QUIC multipath path, as `REMOTE_IP:PORT[@LOCAL_IP][/backup]`.
-    /// `REMOTE` is a proxy address (it may differ from the primary one),
-    /// `LOCAL_IP` pins the path's source address (e.g. a second uplink's
-    /// address), and `/backup` makes it a standby path used only when no
-    /// primary path works. Repeatable. Paths that fail are retried while the
-    /// tunnel is up.
+    /// Open an additional QUIC multipath path, as
+    /// `REMOTE_IP:PORT[@LOCAL_IP][/backup][/priority=N]`. `REMOTE` is a proxy
+    /// address (it may differ from the primary one), `LOCAL_IP` pins the
+    /// path's source address (e.g. a second uplink's address), and `/backup`
+    /// makes it a standby path used only when no primary path works.
+    /// `/priority=N` (0-255, default 0, lower is preferred) orders usable
+    /// paths in both directions: traffic fills the preferred path first and
+    /// spills onto the next ones (see `--path-spill-threshold-ms`); equal
+    /// priorities share traffic. Repeatable. Paths that fail are retried while
+    /// the tunnel is up.
     #[arg(long = "path", value_name = "SPEC")]
     pub paths: Vec<PathSpec>,
+
+    /// Priority of the primary path (the one to `--proxy-addr`), in the same
+    /// terms as `--path .../priority=N`. Only meaningful with `--path`.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    pub primary_priority: u8,
 
     /// Skip TLS certificate verification (testing only).
     #[arg(long)]
@@ -109,6 +129,16 @@ pub struct ClientArgs {
     /// WireGuard) to avoid double congestion control.
     #[arg(long, value_enum, default_value_t = CongestionControl::Bbr3)]
     pub congestion_control: CongestionControl,
+
+    /// Queueing delay (milliseconds) accepted on a preferred path before
+    /// traffic spills onto less preferred ones (paths with a higher
+    /// `/priority=N`). While the preferred path can send everything queued
+    /// within this time at its current BBRv3 rate, lower-priority paths carry
+    /// no data. `0` spills whenever the preferred path is momentarily paced,
+    /// which spreads even light traffic over all paths. Has no effect while
+    /// all paths share one priority.
+    #[arg(long, value_name = "MS", default_value_t = DEFAULT_PATH_SPILL_THRESHOLD.as_millis() as u64)]
+    pub path_spill_threshold_ms: u64,
 }
 
 #[derive(Parser, Debug)]

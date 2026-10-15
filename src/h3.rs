@@ -7,10 +7,17 @@
 //! the response is one HEADERS frame back. Anything that follows on the request
 //! stream (capsules in DATA frames) is drained and ignored, matching
 //! zeromasque — UDP payloads ride QUIC DATAGRAMs (`crate::dgram`).
+//!
+//! One extension: the client announces its multipath path priorities on its
+//! control stream ([`FRAME_PATH_PRIORITY`]) so the proxy prefers the same
+//! paths for the return direction.
+
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::{Buf, Bytes, BytesMut};
-use noq::{Connection, RecvStream, SendStream, VarInt};
+use noq::{Connection, PathId, RecvStream, SendStream, VarInt};
+use tokio::sync::Mutex;
 
 use crate::qpack;
 use crate::varint;
@@ -18,6 +25,13 @@ use crate::varint;
 pub const FRAME_DATA: u64 = 0x00;
 pub const FRAME_HEADERS: u64 = 0x01;
 const FRAME_SETTINGS: u64 = 0x04;
+/// rapidmasque extension frame on the control stream: the sender's scheduling
+/// priority for one multipath path (payload: path ID varint, priority varint
+/// 0-255), so the peer applies the same priority to what it sends on that path
+/// (noq path priorities are local and never on the wire). HTTP/3 peers ignore
+/// unknown frame types (RFC 9114 §9), so other servers are unaffected. The type
+/// is "rmpp" in ASCII, outside the reserved (grease) range.
+pub const FRAME_PATH_PRIORITY: u64 = 0x726d_7070;
 
 const STREAM_CONTROL: u64 = 0x00;
 const STREAM_PUSH: u64 = 0x01;
@@ -49,9 +63,28 @@ pub fn headers_frame(fields: &[(&str, &str)]) -> Vec<u8> {
     frame(FRAME_HEADERS, &qpack::encode(fields))
 }
 
-/// Open our control stream and send SETTINGS. The returned stream must stay
-/// open for the connection's lifetime (closing it is a connection error).
-pub async fn open_control(conn: &Connection) -> Result<SendStream> {
+/// Our HTTP/3 control stream. It must stay open for the connection's lifetime
+/// (closing it is a connection error), so hold a handle until the end.
+#[derive(Clone)]
+pub struct Control(Arc<Mutex<SendStream>>);
+
+impl Control {
+    /// Tell the peer to give `path_id` the scheduling priority `priority`.
+    pub async fn send_path_priority(&self, path_id: PathId, priority: u8) -> Result<()> {
+        let mut payload = Vec::new();
+        varint::encode(u64::from(crate::util::path_id_u32(path_id)), &mut payload);
+        varint::encode(u64::from(priority), &mut payload);
+        self.0
+            .lock()
+            .await
+            .write_all(&frame(FRAME_PATH_PRIORITY, &payload))
+            .await
+            .context("writing PATH_PRIORITY")
+    }
+}
+
+/// Open our control stream and send SETTINGS.
+pub async fn open_control(conn: &Connection) -> Result<Control> {
     let mut send = conn.open_uni().await.context("opening control stream")?;
     let mut settings = Vec::new();
     for (id, value) in [
@@ -69,19 +102,19 @@ pub async fn open_control(conn: &Connection) -> Result<SendStream> {
     send.write_all(&out)
         .await
         .context("writing control SETTINGS")?;
-    Ok(send)
+    Ok(Control(Arc::new(Mutex::new(send))))
 }
 
 /// Service the peer's unidirectional streams until the connection closes:
-/// read its control stream (logging SETTINGS), drain QPACK streams, and refuse
-/// push and unknown stream types.
+/// read its control stream (logging SETTINGS, applying path priorities), drain
+/// QPACK streams, and refuse push and unknown stream types.
 pub async fn serve_uni_streams(conn: Connection) {
     while let Ok(recv) = conn.accept_uni().await {
-        tokio::spawn(serve_uni_stream(recv));
+        tokio::spawn(serve_uni_stream(conn.clone(), recv));
     }
 }
 
-async fn serve_uni_stream(recv: RecvStream) {
+async fn serve_uni_stream(conn: Connection, recv: RecvStream) {
     let mut reader = FrameReader::new(recv);
     let ty = match reader.read_varint().await {
         Ok(Some(ty)) => ty,
@@ -100,8 +133,20 @@ async fn serve_uni_stream(recv: RecvStream) {
                 ),
                 Err(e) => log::debug!("peer control stream: {e}"),
             }
-            // Later control frames (GOAWAY, ...) need no action here.
-            let _ = reader.drain().await;
+            // Other later control frames (GOAWAY, ...) need no action here.
+            loop {
+                match reader.read_frame(MAX_HEADER_FRAME).await {
+                    Ok(Some((FRAME_PATH_PRIORITY, payload))) => {
+                        apply_path_priority(&conn, &payload)
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(e) => {
+                        log::debug!("peer control stream: {e}");
+                        break;
+                    }
+                }
+            }
         }
         STREAM_QPACK_ENCODER | STREAM_QPACK_DECODER => {
             // With a zero-capacity table there is nothing to act on.
@@ -109,6 +154,31 @@ async fn serve_uni_stream(recv: RecvStream) {
         }
         STREAM_PUSH => reader.stop(H3_STREAM_CREATION_ERROR),
         _ => reader.stop(H3_STREAM_CREATION_ERROR), // reserved / unknown
+    }
+}
+
+fn parse_path_priority(payload: &[u8]) -> Option<(PathId, u8)> {
+    let (path_id, n) = varint::decode(payload)?;
+    let (priority, m) = varint::decode(&payload[n..])?;
+    if n + m != payload.len() {
+        return None;
+    }
+    Some((
+        PathId::from(u32::try_from(path_id).ok()?),
+        u8::try_from(priority).ok()?,
+    ))
+}
+
+fn apply_path_priority(conn: &Connection, payload: &[u8]) {
+    let Some((path_id, priority)) = parse_path_priority(payload) else {
+        log::debug!("ignoring malformed PATH_PRIORITY frame");
+        return;
+    };
+    // The peer announces a path once it is established, so it exists here
+    // unless it was abandoned meanwhile.
+    match conn.path(path_id).map(|path| path.set_priority(priority)) {
+        Some(Ok(_)) => log::debug!("path {path_id}: peer set priority {priority}"),
+        _ => log::debug!("path {path_id}: priority {priority} for a closed path ignored"),
     }
 }
 

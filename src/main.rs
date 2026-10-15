@@ -22,12 +22,14 @@ mod util;
 mod varint;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use clap::Parser;
 use noq::{Endpoint, TokioRuntime};
 
+use crate::cc::CongestionControl;
 use crate::cli::{Cli, ClientArgs, Command, GenEchArgs, ServeArgs};
 use crate::ech::key::EchKeySet;
 use crate::endpoint::Endpoint as ProxyEndpoint;
@@ -83,12 +85,13 @@ fn serve(args: ServeArgs) -> Result<()> {
         None => None,
     };
 
+    let transport = transport_options(args.congestion_control, args.path_spill_threshold_ms);
     let config = quic::build_server_config(
         &args.cert,
         &args.key,
         ech.as_ref(),
         rule_table.allowed_sni_hosts(),
-        args.congestion_control,
+        transport,
     )?;
     let state = Arc::new(ServerState {
         rules: ArcSwap::from_pointee(rule_table),
@@ -98,7 +101,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         key: args.key.clone(),
         ech_key: args.ech_key.clone(),
         rules: args.rules.clone(),
-        congestion_control: args.congestion_control,
+        transport,
     };
 
     runtime().block_on(async move {
@@ -136,12 +139,24 @@ fn client(args: ClientArgs) -> Result<()> {
             verify,
             ech_config_list: load_ech_config(&args)?,
             paths: args.paths.clone(),
-            congestion_control: args.congestion_control,
+            primary_priority: args.primary_priority,
+            transport: transport_options(args.congestion_control, args.path_spill_threshold_ms),
         },
         listen: args.listen,
     };
 
     runtime().block_on(client::run_proxy(opts))
+}
+
+fn transport_options(
+    congestion_control: CongestionControl,
+    path_spill_threshold_ms: u64,
+) -> quic::TransportOptions {
+    quic::TransportOptions {
+        congestion_control,
+        path_spill_threshold: (path_spill_threshold_ms > 0)
+            .then(|| Duration::from_millis(path_spill_threshold_ms)),
+    }
 }
 
 fn gen_ech_key(args: GenEchArgs) -> Result<()> {

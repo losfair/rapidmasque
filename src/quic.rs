@@ -169,8 +169,33 @@ pub(crate) fn endpoint_config() -> EndpointConfig {
     config
 }
 
+/// Transport settings chosen on the command line, shared by client and server.
+#[derive(Debug, Clone, Copy)]
+pub struct TransportOptions {
+    /// Outer congestion control for what this side sends.
+    pub congestion_control: CongestionControl,
+    /// How long data may queue for a preferred (lower priority value) path
+    /// before it spills onto less preferred paths. `None` spills as soon as
+    /// the preferred path is held back by its pacer or congestion window.
+    pub path_spill_threshold: Option<Duration>,
+}
+
+impl Default for TransportOptions {
+    fn default() -> Self {
+        Self {
+            congestion_control: CongestionControl::Bbr3,
+            path_spill_threshold: Some(DEFAULT_PATH_SPILL_THRESHOLD),
+        }
+    }
+}
+
+/// Default for `--path-spill-threshold-ms`: the extra queueing delay accepted
+/// on a preferred path before traffic spills onto less preferred ones. Only
+/// matters once paths have different priorities.
+pub const DEFAULT_PATH_SPILL_THRESHOLD: Duration = Duration::from_millis(10);
+
 /// The QUIC transport parameters common to client and server.
-fn transport_config(keepalive: bool, cc: CongestionControl) -> Arc<TransportConfig> {
+fn transport_config(keepalive: bool, opts: TransportOptions) -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
     let idle = IdleTimeout::try_from(IDLE_TIMEOUT).expect("idle timeout fits a varint");
     t.max_idle_timeout(Some(idle));
@@ -183,7 +208,7 @@ fn transport_config(keepalive: bool, cc: CongestionControl) -> Arc<TransportConf
     // non-congestive loss; with multipath, noq runs one instance per path.
     // `none` drops outer congestion control entirely, for payloads that are
     // already congestion-controlled end to end (see `crate::cc`).
-    t.congestion_controller_factory(cc.factory());
+    t.congestion_controller_factory(opts.congestion_control.factory());
     // Multipath (draft-ietf-quic-multipath): both ends advertise support, so
     // the client may open extra paths (other local interfaces / server
     // addresses) and noq schedules datagrams across them.
@@ -195,6 +220,13 @@ fn transport_config(keepalive: bool, cc: CongestionControl) -> Arc<TransportConf
     // would leave the other side's extra paths silent, and they would time out
     // and churn every ~10 s on an idle tunnel even though the links are fine.
     t.default_path_keep_alive_interval(Some(KEEPALIVE));
+    // Paths are tried in priority order (client `--path .../priority=N`, sent
+    // to the server over the HTTP/3 control stream, see `crate::h3`). A
+    // preferred path that is only held back by its pacer keeps the data while
+    // it can drain the queue within this threshold; beyond that, data spills
+    // onto less preferred paths. Without differing priorities this has no
+    // effect.
+    t.path_spill_threshold(opts.path_spill_threshold);
     if keepalive {
         t.keep_alive_interval(Some(KEEPALIVE));
     }
@@ -264,7 +296,7 @@ pub fn build_server_config(
     key_path: &Path,
     ech: Option<&EchKeySet>,
     allowed_sni_hosts: Vec<String>,
-    cc: CongestionControl,
+    opts: TransportOptions,
 ) -> Result<noq::ServerConfig> {
     let mut builder =
         SslContextBuilder::new(SslMethod::tls()).context("creating BoringSSL server context")?;
@@ -293,7 +325,7 @@ pub fn build_server_config(
     install_sni_guard(&mut builder, allowed_sni_hosts);
 
     let mut config = noq::ServerConfig::with_crypto(ServerTls::new(builder)?);
-    config.transport_config(transport_config(false, cc));
+    config.transport_config(transport_config(false, opts));
     Ok(config)
 }
 
@@ -335,7 +367,7 @@ pub enum Verify {
 pub fn build_client_config(
     verify: &Verify,
     ech_config_list: Option<Vec<u8>>,
-    cc: CongestionControl,
+    opts: TransportOptions,
 ) -> Result<noq::ClientConfig> {
     let mut builder =
         SslContextBuilder::new(SslMethod::tls()).context("creating BoringSSL client context")?;
@@ -366,7 +398,7 @@ pub fn build_client_config(
     };
 
     let mut config = noq::ClientConfig::new(ClientTls::new(builder, verify_peer, ech_config_list)?);
-    config.transport_config(transport_config(true, cc));
+    config.transport_config(transport_config(true, opts));
     Ok(config)
 }
 
