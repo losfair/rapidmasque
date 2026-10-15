@@ -8,8 +8,7 @@ use clap::{Args, Parser, Subcommand};
 use crate::cc::CongestionControl;
 use crate::client::PathSpec;
 use crate::quic::{
-    DEFAULT_BBR3_INITIAL_WINDOW, DEFAULT_DATAGRAM_QUEUE_INTERVAL, DEFAULT_DATAGRAM_QUEUE_MAX,
-    DEFAULT_DATAGRAM_QUEUE_TARGET, DEFAULT_PATH_SPILL_THRESHOLD, TransportOptions,
+    DATAGRAM_CODEL, DEFAULT_BBR3_INITIAL_WINDOW, DEFAULT_PATH_SPILL_THRESHOLD, TransportOptions,
 };
 use crate::ranking::PathRanking;
 
@@ -185,32 +184,6 @@ pub struct TransportArgs {
     /// all paths share one priority.
     #[arg(long, value_name = "MS", default_value_t = DEFAULT_PATH_SPILL_THRESHOLD.as_millis() as u64)]
     pub path_spill_threshold_ms: u64,
-
-    /// Target queueing delay (milliseconds) for tunnelled datagrams waiting
-    /// to be sent (CoDel, RFC 8289). When they keep waiting longer than this
-    /// for a whole `--datagram-queue-interval-ms`, the oldest are dropped at
-    /// an increasing rate, so a tunnelled TCP flow that outpaces the paths
-    /// sees loss promptly instead of filling a multi-second queue that every
-    /// other flow then waits behind. `0` disables it: datagrams are then only
-    /// dropped when the 4 MiB send buffer is full.
-    #[arg(long, value_name = "MS", default_value_t = DEFAULT_DATAGRAM_QUEUE_TARGET.as_millis() as u64)]
-    pub datagram_queue_target_ms: u64,
-
-    /// How long (milliseconds) the queueing delay may stay above
-    /// `--datagram-queue-target-ms` before dropping starts. It should be at
-    /// least the tunnelled flows' round-trip time, so the target, interval
-    /// and hard limit are scaled up for paths with a longer round-trip time,
-    /// in proportion to the largest minimum RTT among the tunnel's paths
-    /// (e.g. 13.5 / 270 / 540 ms at 270 ms with the defaults).
-    #[arg(long, value_name = "MS", default_value_t = DEFAULT_DATAGRAM_QUEUE_INTERVAL.as_millis() as u64, value_parser = clap::value_parser!(u64).range(1..))]
-    pub datagram_queue_interval_ms: u64,
-
-    /// Hard limit (milliseconds) on how long a tunnelled datagram may wait to
-    /// be sent; older ones are always dropped. Catches traffic that does not
-    /// slow down on loss (e.g. constant-rate UDP above the path's rate), which
-    /// CoDel alone sheds too slowly. `0` removes the limit.
-    #[arg(long, value_name = "MS", default_value_t = DEFAULT_DATAGRAM_QUEUE_MAX.as_millis() as u64)]
-    pub datagram_queue_max_ms: u64,
 }
 
 impl TransportArgs {
@@ -227,13 +200,7 @@ impl TransportArgs {
                 .unwrap_or(DEFAULT_BBR3_INITIAL_WINDOW),
             path_spill_threshold: (self.path_spill_threshold_ms > 0)
                 .then(|| Duration::from_millis(self.path_spill_threshold_ms)),
-            datagram_codel: (self.datagram_queue_target_ms > 0).then(|| noq::DatagramCodel {
-                target: Duration::from_millis(self.datagram_queue_target_ms),
-                interval: Duration::from_millis(self.datagram_queue_interval_ms),
-                max_delay: (self.datagram_queue_max_ms > 0)
-                    .then(|| Duration::from_millis(self.datagram_queue_max_ms)),
-                scale_with_rtt: true,
-            }),
+            datagram_codel: Some(DATAGRAM_CODEL),
         })
     }
 }
@@ -274,15 +241,7 @@ mod tests {
             options.path_spill_threshold,
             Some(Duration::from_millis(10))
         );
-        assert_eq!(
-            options.datagram_codel,
-            Some(noq::DatagramCodel {
-                target: Duration::from_millis(5),
-                interval: Duration::from_millis(100),
-                max_delay: Some(Duration::from_millis(200)),
-                scale_with_rtt: true,
-            })
-        );
+        assert_eq!(options.datagram_codel, Some(DATAGRAM_CODEL));
         let parse = |flags: &[&str]| {
             let mut argv = vec![
                 "rapidmasque",
@@ -316,16 +275,8 @@ mod tests {
             .options()
             .is_err()
         );
-        let args = parse(&[
-            "--datagram-queue-target-ms",
-            "0",
-            "--path-spill-threshold-ms",
-            "0",
-        ])
-        .unwrap();
+        let args = parse(&["--path-spill-threshold-ms", "0"]).unwrap();
         let options = args.transport.options().unwrap();
-        assert_eq!(options.datagram_codel, None);
         assert_eq!(options.path_spill_threshold, None);
-        assert!(parse(&["--datagram-queue-interval-ms", "0"]).is_err());
     }
 }

@@ -89,7 +89,7 @@ and documented in `README.md`.
   (`.github/scripts/smoke-test.sh`) exercises a real `rtable=0` path. OpenBSD
   has no dual-stack sockets: `quic::client_bind_socket` falls back to the
   primary's family there.
-- Outgoing datagram queue management (`--datagram-queue-*`, default on)
+- Outgoing datagram queue management (always on, no flags; `quic::DATAGRAM_CODEL`)
   is noq's `TransportConfig::datagram_send_codel` (CoDel plus a hard
   `max_delay`, in the losfair/noq fork): the queue that builds up is noq's
   send buffer, so drops must happen there, where the queueing time is known.

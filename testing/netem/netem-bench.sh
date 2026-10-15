@@ -22,7 +22,7 @@
 #   GENCERT       testing/gencert.go binary (default: built with go)
 #   DURATION      seconds of load per run (default 20)
 #   SCENARIOS     subset of: hirtt hirtt-loss lowrtt (default: all)
-#   VARIANTS      subset of: default no-aqm cc-none (default: all)
+#   VARIANTS      subset of: auto cc-none (default: all)
 #   DIRECTIONS    subset of: download upload (default: download)
 #   REPEATS       runs per cell; the report shows medians (default 1)
 #   BUF_MS        bottleneck buffer beyond the delay line, in ms at line rate
@@ -41,7 +41,7 @@ RAPIDMASQUE="${RAPIDMASQUE:-$ROOT/target/release/rapidmasque}"
 WIREGUARD_GO="${WIREGUARD_GO:-$(command -v wireguard-go || true)}"
 DURATION="${DURATION:-20}"
 SCENARIOS="${SCENARIOS:-hirtt hirtt-loss lowrtt}"
-VARIANTS="${VARIANTS:-default no-aqm cc-none}"
+VARIANTS="${VARIANTS:-auto cc-none}"
 DIRECTIONS="${DIRECTIONS:-download}"
 REPEATS="${REPEATS:-1}"
 BUF_MS="${BUF_MS:-100}"
@@ -66,8 +66,7 @@ scenario() {
 # name: rapidmasque flags for both ends
 variant() {
     case "$1" in
-        default) echo "" ;;
-        no-aqm) echo "--datagram-queue-target-ms 0 --datagram-queue-max-ms 0" ;;
+        auto) echo "" ;; # the defaults
         cc-none) echo "--congestion-control none" ;;
         *) echo "unknown variant $1" >&2; exit 2 ;;
     esac
