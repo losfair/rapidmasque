@@ -25,14 +25,12 @@ mod util;
 mod varint;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use clap::Parser;
 use noq::{Endpoint, TokioRuntime};
 
-use crate::cc::CongestionControl;
 use crate::cli::{Cli, ClientArgs, Command, GenEchArgs, ServeArgs};
 use crate::ech::key::EchKeySet;
 use crate::endpoint::Endpoint as ProxyEndpoint;
@@ -89,11 +87,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         None => None,
     };
 
-    let transport = transport_options(
-        args.congestion_control,
-        args.bbr3_initial_window,
-        args.path_spill_threshold_ms,
-    )?;
+    let transport = args.transport.options()?;
     let config = quic::build_server_config(
         &args.cert,
         &args.key,
@@ -172,11 +166,7 @@ fn client(args: ClientArgs) -> Result<()> {
             rtable: args.rtable,
             path_ranking: args.path_ranking,
             stats: args.stats_listen.map(|_| stats::Registry::new("client")),
-            transport: transport_options(
-                args.congestion_control,
-                args.bbr3_initial_window,
-                args.path_spill_threshold_ms,
-            )?,
+            transport: args.transport.options()?,
         },
         listen: args.listen,
     };
@@ -198,22 +188,6 @@ async fn start_stats(
         tokio::spawn(stats::serve(listener, registry));
     }
     Ok(())
-}
-
-fn transport_options(
-    congestion_control: CongestionControl,
-    bbr3_initial_window: Option<u64>,
-    path_spill_threshold_ms: u64,
-) -> Result<quic::TransportOptions> {
-    if bbr3_initial_window.is_some() && congestion_control != CongestionControl::Bbr3 {
-        anyhow::bail!("--bbr3-initial-window needs --congestion-control bbr3");
-    }
-    Ok(quic::TransportOptions {
-        congestion_control,
-        bbr3_initial_window: bbr3_initial_window.unwrap_or(quic::DEFAULT_BBR3_INITIAL_WINDOW),
-        path_spill_threshold: (path_spill_threshold_ms > 0)
-            .then(|| Duration::from_millis(path_spill_threshold_ms)),
-    })
 }
 
 fn gen_ech_key(args: GenEchArgs) -> Result<()> {

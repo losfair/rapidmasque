@@ -3,7 +3,8 @@
 //! `GET /stats` (or `/`) returns a JSON snapshot of every live QUIC connection
 //! and each of its multipath paths: addresses, status, priorities and
 //! automatic-ranking state, RTT, congestion window, MTU and traffic/loss
-//! counters. It is a minimal HTTP/1.1 responder (one request per TCP
+//! counters, plus how many outgoing datagrams were dropped for queueing
+//! delay (CoDel) or a full send buffer. It is a minimal HTTP/1.1 responder (one request per TCP
 //! connection, no TLS, no authentication), meant to be bound to loopback or a
 //! management network.
 
@@ -169,6 +170,8 @@ fn connection_stats(entry: &Entry) -> Value {
         "info": entry.info,
         "sent_packets": stats.sent_packets,
         "lost_packets": stats.lost_packets,
+        "datagrams_dropped_delay": stats.datagrams_dropped_delay,
+        "datagrams_dropped_overflow": stats.datagrams_dropped_overflow,
         "udp_tx": udp(&stats.udp_tx),
         "udp_rx": udp(&stats.udp_rx),
         "paths": paths,

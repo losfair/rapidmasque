@@ -182,6 +182,34 @@ HTTP/3 control and request-stream traffic is not rate-limited either; it stays
 reliable, since loss detection and retransmission keep running. ACKs, RTT
 estimation and MTU discovery are unaffected.
 
+#### Datagram queue management
+
+Tunnelled datagrams that arrive faster than the paths carry wait in the QUIC
+connection's send buffer. Without management, a tunnelled TCP flow (e.g.
+CUBIC inside WireGuard) keeps speeding up until it sees loss, and the only
+loss would be the 4 MiB buffer overflowing: a standing queue of ~1.7 s at
+20 Mbit/s that every other tunnelled flow, interactive ones included, waits
+behind. So each side manages its queue (on `serve` and `client`):
+
+- **CoDel** (RFC 8289): once datagrams keep waiting longer than a target
+  delay for a whole interval, the oldest are dropped at an increasing rate
+  until the delay is back under the target. Bursts pass, and tunnelled TCP
+  sees loss promptly and settles at a low queueing delay.
+- **A hard limit**: datagrams that waited longer than this are always
+  dropped. CoDel sheds traffic that does not slow down on loss (e.g.
+  constant-rate UDP above the path's rate) too slowly; without the limit it
+  would still queue up to the buffer size.
+
+There is nothing to tune: the target, interval and limit (5, 100 and 200 ms)
+follow the largest minimum RTT among the tunnel's paths once it exceeds
+100 ms, e.g. 13.5, 270 and 540 ms on a 270 ms path. CoDel's interval must be
+at least the RTT of the flows it drops for; in the netem testbed a fixed
+100 ms interval on a 270 ms path made tunnelled TCP retransmit ~9x as much
+(1434 vs 166 segments per 20 s download) at the same latency.
+
+The stats endpoint counts drops per connection (`datagrams_dropped_delay`,
+and `datagrams_dropped_overflow` for a full buffer).
+
 ### QUIC multipath
 
 Both ends negotiate the QUIC multipath extension (up to 8 concurrent paths per
@@ -474,6 +502,23 @@ The harness exercises: rapidmasque client -> masque-go proxy, masque-go
 (variable-template) client -> rapidmasque pinned server, rapidmasque <->
 rapidmasque, an ECH variant, SIGHUP certificate and rule reload checks, and a
 multipath case (two extra paths via 127.0.0.2 / 127.0.0.3).
+
+Behaviour on shaped links (Linux, root; needs `tc netem`, iperf3, `wg`,
+ethtool and a `wireguard-go` binary):
+
+```
+sudo WIREGUARD_GO=/path/to/wireguard-go testing/netem/netem-bench.sh
+```
+
+It runs the production stack, TCP (iperf3) inside WireGuard (MTU 1280) inside
+a rapidmasque tunnel, between two network namespaces whose link is shaped with
+netem: 20 Mbit/s at 270 ms RTT with and without 1% loss, and 50 Mbit/s at
+20 ms RTT. Each link is measured with the defaults (`auto`: BBRv3 with
+RTT-scaled queue management) and with `--congestion-control none` (`REPEATS=n` reports medians over n runs),
+reporting TCP goodput and
+retransmits, the latency of a ping alongside the load, and the tunnel's drop
+counters (`target/netem/report.md`). The `netem` CI workflow runs it on every
+pull request and publishes the report in the job summary.
 
 ## Layout
 

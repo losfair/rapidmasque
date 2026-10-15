@@ -37,7 +37,9 @@ const KEEPALIVE: Duration = Duration::from_secs(1);
 pub(crate) const MAX_PATHS: u32 = 8;
 /// Bytes of outgoing/incoming QUIC DATAGRAMs buffered inside noq. When the
 /// send buffer is full, noq drops the oldest datagram (UDP is lossy by
-/// contract).
+/// contract). The send buffer is only a memory cap: queueing delay is kept
+/// low by CoDel (`TransportOptions::datagram_codel`), long before 4 MiB
+/// (~1.7 s at 20 Mbit/s) would queue up.
 const DGRAM_SEND_BUFFER: usize = 4 * 1024 * 1024;
 const DGRAM_RECV_BUFFER: usize = 8 * 1024 * 1024;
 
@@ -222,6 +224,9 @@ pub struct TransportOptions {
     /// before it spills onto less preferred paths. `None` spills as soon as
     /// the preferred path is held back by its pacer or congestion window.
     pub path_spill_threshold: Option<Duration>,
+    /// Queue management (CoDel) for outgoing datagrams. `None` drops them
+    /// only when the send buffer is full.
+    pub datagram_codel: Option<noq::DatagramCodel>,
 }
 
 impl Default for TransportOptions {
@@ -230,9 +235,45 @@ impl Default for TransportOptions {
             congestion_control: CongestionControl::Bbr3,
             bbr3_initial_window: DEFAULT_BBR3_INITIAL_WINDOW,
             path_spill_threshold: Some(DEFAULT_PATH_SPILL_THRESHOLD),
+            datagram_codel: Some(DATAGRAM_CODEL),
         }
     }
 }
+
+/// Outgoing datagram queue management, always on: CoDel plus a hard limit,
+/// scaled with the paths' RTT. Not configurable: the values below only
+/// describe paths up to 100 ms RTT, and RTT scaling picks the rest.
+pub const DATAGRAM_CODEL: noq::DatagramCodel = noq::DatagramCodel {
+    target: DATAGRAM_QUEUE_TARGET,
+    interval: DATAGRAM_QUEUE_INTERVAL,
+    max_delay: Some(DATAGRAM_QUEUE_MAX),
+    scale_with_rtt: true,
+};
+
+/// CoDel target for outgoing datagrams: RFC 8289's 5 ms.
+///
+/// Without queue management, a tunnelled TCP flow that outpaces the paths
+/// grows until it sees loss, and the only loss is noq's 4 MiB send buffer
+/// overflowing: a standing queue of ~1.7 s at 20 Mbit/s that every other
+/// tunnelled flow waits behind.
+const DATAGRAM_QUEUE_TARGET: Duration = Duration::from_millis(5);
+/// CoDel interval: RFC 8289's 100 ms.
+///
+/// The target, interval and hard limit are for paths with a round-trip time
+/// of up to this interval; on longer paths they are always scaled up with the
+/// largest minimum RTT, so that CoDel does not drop again before the
+/// tunnelled senders could react: on a 270 ms path a fixed 100 ms interval
+/// made tunnelled TCP retransmit ~9x as much, for no latency gain
+/// (testing/netem).
+const DATAGRAM_QUEUE_INTERVAL: Duration = Duration::from_millis(100);
+/// Hard limit on datagram queueing delay.
+///
+/// CoDel keeps flows that slow down on loss near the target, but its drop rate
+/// grows too slowly for tunnelled traffic that does not (e.g. a constant-rate
+/// UDP stream above the path's rate): that would still queue up to the 4 MiB
+/// send buffer. Datagrams older than this are always dropped. Two intervals
+/// leave room for any burst CoDel itself would let through.
+const DATAGRAM_QUEUE_MAX: Duration = Duration::from_millis(200);
 
 /// Default for `--bbr3-initial-window`: 64 KiB, ~48 full-size packets.
 ///
@@ -297,6 +338,7 @@ fn transport_config(keepalive: bool, opts: TransportOptions) -> Arc<TransportCon
     t.min_mtu(INITIAL_MTU);
     t.datagram_receive_buffer_size(Some(DGRAM_RECV_BUFFER));
     t.datagram_send_buffer_size(DGRAM_SEND_BUFFER);
+    t.datagram_send_codel(opts.datagram_codel);
     Arc::new(t)
 }
 
