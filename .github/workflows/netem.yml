@@ -1,0 +1,79 @@
+name: netem
+
+# Tunnel behaviour on shaped links (tc netem): TCP inside WireGuard inside a
+# rapidmasque tunnel, across network namespaces, with and without datagram
+# queue management and outer congestion control. See testing/netem/. The
+# results are a report (job summary and artifact), not pass/fail thresholds;
+# the job fails only if a tunnel does not come up.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: Seconds of load per run
+        default: "20"
+
+env:
+  CARGO_TERM_COLOR: always
+  # wireguard-go is pinned for reproducible runs.
+  WIREGUARD_GO_VERSION: v0.0.0-20261006164505-2631ce99a06f
+
+permissions:
+  contents: read
+
+jobs:
+  netem:
+    name: netem testbed
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake iproute2 ethtool iperf3 wireguard-tools iputils-ping curl
+          sudo modprobe sch_netem || {
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe sch_netem
+          }
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Build wireguard-go
+        run: |
+          GOBIN="$PWD/out/bin" go install "golang.zx2c4.com/wireguard@${WIREGUARD_GO_VERSION}"
+          GO111MODULE=off go build -o out/bin/gencert testing/gencert.go
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build rapidmasque (release)
+        run: cargo build --release --locked
+
+      - name: Run the testbed
+        run: |
+          sudo env WIREGUARD_GO="$PWD/out/bin/wireguard" GENCERT="$PWD/out/bin/gencert" \
+            DURATION="${{ inputs.duration || '20' }}" DIRECTIONS="download upload" \
+            testing/netem/netem-bench.sh "$PWD/out/netem"
+
+      - name: Report
+        if: always()
+        run: |
+          if [ -f out/netem/report.md ]; then
+            cat out/netem/report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: netem-results
+          path: out/netem

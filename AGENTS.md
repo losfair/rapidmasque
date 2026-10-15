@@ -32,6 +32,11 @@ and documented in `README.md`.
   (Linux routes all of 127.0.0.0/8 to `lo`).
 - `./testing/interop.sh` — end-to-end interop against masque-go (needs `go` and a
   masque-go checkout at `../masque-go`, override with `MASQUE_GO=`).
+- `testing/netem/netem-bench.sh` — tc netem testbed (root): TCP inside
+  wireguard-go inside the tunnel across two network namespaces with shaped
+  links; writes a Markdown report. CI runs it as the `netem` workflow
+  (report only). `ALLOW_TBF=1` shapes rate-only with tbf where the kernel lacks
+  netem (development only).
 - `kill -SIGHUP <pid>` — hot-reload the server's TLS certificate, ECH keys and
   rule table (any Unix).
 

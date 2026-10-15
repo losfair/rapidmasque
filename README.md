@@ -500,6 +500,22 @@ The harness exercises: rapidmasque client -> masque-go proxy, masque-go
 rapidmasque, an ECH variant, SIGHUP certificate and rule reload checks, and a
 multipath case (two extra paths via 127.0.0.2 / 127.0.0.3).
 
+Behaviour on shaped links (Linux, root; needs `tc netem`, iperf3, `wg`,
+ethtool and a `wireguard-go` binary):
+
+```
+sudo WIREGUARD_GO=/path/to/wireguard-go testing/netem/netem-bench.sh
+```
+
+It runs the production stack, TCP (iperf3) inside WireGuard (MTU 1280) inside
+a rapidmasque tunnel, between two network namespaces whose link is shaped with
+netem: 20 Mbit/s at 270 ms RTT with and without 1% loss, and 50 Mbit/s at
+20 ms RTT. Each link is measured with the defaults, without datagram queue
+management, and with `--congestion-control none`, reporting TCP goodput and
+retransmits, the latency of a ping alongside the load, and the tunnel's drop
+counters (`target/netem/report.md`). The `netem` CI workflow runs it on every
+pull request and publishes the report in the job summary.
+
 ## Layout
 
 - `src/server.rs` - the CONNECT-UDP proxy (rule-pinned): a task per connection
