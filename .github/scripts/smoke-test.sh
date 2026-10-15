@@ -13,6 +13,7 @@ work="$(mktemp -d)"
 pids=""
 cleanup() {
     for p in $pids; do kill "$p" 2>/dev/null || true; done
+    [ "$(uname -s)" != OpenBSD ] || sudo -n pkill -x tcpdump 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -40,7 +41,9 @@ diagnose() {
     [ "$(uname -s)" = OpenBSD ] || return 0
     echo "--- client process"; ps -o pid,pcpu,state,wchan,command -p "$1" || true
     echo "--- client stats"; ftp -V -o - "http://127.0.0.1:$2/stats" 2>&1 || true
-    echo "--- server stats"; ftp -V -o - "http://127.0.0.1:9100/stats" 2>&1 || true
+    for port in 9100 9101; do
+        echo "--- server stats ($port)"; ftp -V -o - "http://127.0.0.1:$port/stats" 2>&1 || true
+    done
     echo "--- client syscalls (2 s)"
     if ktrace -f "$work/ktrace.out" -t cn -p "$1"; then
         sleep 2
@@ -50,14 +53,33 @@ diagnose() {
     echo "--- udp sockets"; netstat -an -f inet -p udp || true
 }
 
+# show_logs CLIENT_LOG: the server's and a client's log; trace logs without
+# their span enter/exit noise.
+show_logs() {
+    for log in "$work/server.log" "$work/server-trace.log" "$1"; do
+        [ -f "$log" ] || continue
+        echo "--- $(basename "$log")"
+        grep -v -e '^\[TRACE\] \(->\|<-\|--\) ' -e '^\[TRACE\] nothing' "$log" | tail -n 1500
+    done
+    for cap in "$work"/tcpdump-*.txt; do
+        [ -f "$cap" ] || continue
+        echo "--- $(basename "$cap")"; tail -n 200 "$cap"
+    done
+    if [ -f "$work/udpstat.before" ]; then
+        echo "--- UDP counters, before and now"
+        cat "$work/udpstat.before"
+        netstat -s -p udp || true
+    fi
+}
+
 # check NAME PORT [CLIENT_ARGS...]: tunnel one datagram through a fresh client.
 check() {
     name="$1"
     port="$2"
     shift 2
     stats=$((port + 1000))
-    "$bin" client --listen "127.0.0.1:$port" \
-        --endpoint https://localhost:4433/connect --proxy-addr 127.0.0.1:4433 \
+    RUST_LOG="${CLIENT_LOG:-info}" "$bin" client --listen "127.0.0.1:$port" \
+        --endpoint https://localhost:4433/connect --proxy-addr "127.0.0.1:${proxy_port:-4433}" \
         --stats-listen "127.0.0.1:$stats" \
         --insecure "$@" > "$work/client-$name.log" 2>&1 &
     cpid=$!
@@ -76,8 +98,7 @@ check() {
         echo "FAIL: $name"
         diagnose "$cpid" "$stats"
         kill "$cpid" 2>/dev/null || true
-        echo "--- server log"; cat "$work/server.log"
-        echo "--- client log"; cat "$work/client-$name.log"
+        show_logs "$work/client-$name.log"
         exit 1
     fi
     kill "$cpid" 2>/dev/null || true
@@ -106,9 +127,24 @@ if [ "$(uname -s)" = OpenBSD ]; then
     # The same extra path without a routing table first, to tell multipath
     # problems from routing-table ones.
     check multipath 6005 --path "$egress_ip:4433"
-    spec="$egress_ip:4433/rtable=0"
-    "$bin" client --listen 127.0.0.1:6003 \
-        --endpoint https://localhost:4433/connect --proxy-addr 127.0.0.1:4433 \
+    # Diagnostics: a second server with noq's trace log, client trace logs,
+    # packet captures and UDP counters, all shown if a check fails.
+    RUST_LOG=trace "$bin" serve --addr 0.0.0.0:4434 --rules "$work/rules.json" \
+        --cert "$work/cert.pem" --key "$work/key.pem" \
+        --stats-listen 127.0.0.1:9101 > "$work/server-trace.log" 2>&1 &
+    pids="$pids $!"
+    egress_if="$(ifconfig egress | sed -n '1s/:.*//p')"
+    for ifc in lo0 "$egress_if"; do
+        sudo tcpdump -n -l -i "$ifc" udp port 4434 > "$work/tcpdump-$ifc.txt" 2>&1 &
+        pids="$pids $!"
+    done
+    netstat -s -p udp > "$work/udpstat.before" 2>&1 || true
+    sleep 2
+    proxy_port=4434
+    export CLIENT_LOG=trace
+    spec="$egress_ip:4434/rtable=0"
+    RUST_LOG=trace "$bin" client --listen 127.0.0.1:6003 \
+        --endpoint https://localhost:4433/connect --proxy-addr 127.0.0.1:4434 \
         --stats-listen 127.0.0.1:7003 \
         --insecure --path "$spec" > "$work/client-rtable-up.log" 2>&1 &
     cpid=$!
@@ -119,8 +155,7 @@ if [ "$(uname -s)" = OpenBSD ]; then
         if [ $i -gt 10 ]; then
             echo "FAIL: path $spec did not come up"
             diagnose "$cpid" 7003
-            echo "--- server log"; cat "$work/server.log"
-            echo "--- client log"; cat "$work/client-rtable-up.log"
+            show_logs "$work/client-rtable-up.log"
             exit 1
         fi
         sleep 1
