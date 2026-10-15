@@ -95,6 +95,19 @@ and documented in `README.md`.
   readiness on it and wait forever for a kqueue write event, silencing every
   connection on the socket. It looked like a routing-table bug; the smoke
   test's back-to-back multipath rounds reproduce it within a few rounds.
+- Per-path congestion control: `/rate=RATE` (and `--primary-rate`) puts a
+  path on `cc::FixedRate` through noq's `Path::set_congestion_controller`
+  (losfair/noq fork); the client announces it with the `FRAME_PATH_RATE`
+  control frame and the server applies it up to `--max-path-rate`. The fixed
+  window (2 RTTs at the rate) is what still moves traffic off a dead path.
+- In-order delivery: flows that negotiate the `rapidmasque-sequence` header
+  carry sequenced datagrams (`dgram::CONTEXT_ID_SEQUENCED_UDP`, 4-byte
+  sequence number) and the receiver resequences them per flow
+  (`reorder::Reorder`, self-tuning hold time). The 4 bytes are part of
+  `quic::WIREGUARD_1280_DATAGRAM`, hence the 1356-byte default minimum MTU.
+- Dial fallback (`client::handshake_candidates`): the primary handshake gets
+  3 s, then extra paths' remotes are tried (no `@LOCAL_IP`, other remote);
+  path 0 is then that extra path, and the primary is opened like any path.
 - Outgoing datagram queue management (always on, no flags; `quic::DATAGRAM_CODEL`)
   is noq's `TransportConfig::datagram_send_codel` (CoDel plus a hard
   `max_delay`, in the losfair/noq fork): the queue that builds up is noq's

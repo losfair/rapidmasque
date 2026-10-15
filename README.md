@@ -225,7 +225,7 @@ rapidmasque client \
   --path '203.0.113.8:4433@10.64.0.5/backup'
 ```
 
-A path spec is `REMOTE_IP:PORT[@LOCAL_IP][/backup][/priority=N][/rtable=N]`:
+A path spec is `REMOTE_IP:PORT[@LOCAL_IP][/backup][/priority=N][/rate=RATE][/rtable=N]`:
 
 - `REMOTE_IP:PORT` - a proxy address. It may differ from the primary one (the
   proxy's IPv6 address, another address of the same host, ...); the server must
@@ -238,12 +238,20 @@ A path spec is `REMOTE_IP:PORT[@LOCAL_IP][/backup][/priority=N][/rtable=N]`:
 - `/priority=N` - scheduling priority, 0-255, lower is preferred (default 0).
   See [Path priority](#path-priority). The primary path's priority is
   `--primary-priority` (default 0).
+- `/rate=RATE` - send on the path at a fixed rate (bits per second, e.g.
+  `48M`) instead of under congestion control, for a link of known, dedicated
+  capacity. See [Fixed-rate paths](#fixed-rate-paths). The primary path's is
+  `--primary-rate`.
 - `/rtable=N` - OpenBSD only: send the path through routing table `N`
   (rtable(4)). See [Routing tables](#routing-tables-openbsd).
 
 The primary path (`--proxy-addr`, or the resolved endpoint host) is the
 handshake path, path 0 (path IDs are never reused: a re-opened path gets a new
-one).
+one). If it gets no answer within 3 s, the client tries the handshake on the
+extra paths' proxy addresses instead, in priority order (`/backup` paths
+last; only paths without `@LOCAL_IP`, to another remote than the primary), so
+the tunnel comes up even while the primary link is down; the primary path then
+joins once it works.
 Extra paths are opened once the tunnel is up. They, and the primary path, are
 re-opened whenever they fail or are abandoned (quick retries backing off to
 every 5 s), so a flapping uplink rejoins automatically. Every path has its own
@@ -292,6 +300,58 @@ larger threshold keeps more traffic on A at the cost of latency; `0` turns the
 hold-back off. Each side's flag governs what it sends. Paths with equal
 priority always share traffic, and `/backup` paths still only carry traffic
 when no non-backup path is usable.
+
+#### Fixed-rate paths
+
+A link of known capacity that nothing else shares (a dedicated line) needs no
+congestion control: `/rate=RATE` (or `--primary-rate` for the primary path)
+sends on it at that fixed rate. Continuing the example above, with A a
+dedicated 50 Mbit/s line:
+
+```
+rapidmasque client ... \
+  --proxy-addr 203.0.113.7:4433 --primary-rate 48M \
+  --path '198.51.100.9:4433/priority=1'
+rapidmasque serve ... --max-path-rate 100M
+```
+
+- A then runs at a steady 48 Mbit/s: BBRv3 would keep probing above the line
+  rate and periodically cut its window to re-measure the RTT, and each probe
+  or cut moves traffic onto B. Set the rate a little below the line rate to
+  leave room for IP/UDP headers.
+- Spill-over to B starts exactly when more than the fixed rate is offered
+  (the spill threshold applies as above), and stops when it is not.
+- If A goes down, its window (about two round trips' worth at the fixed rate)
+  fills within a round trip and traffic moves to B right away, as it would
+  for a congestion-controlled path. Loss on A is not a congestion signal and
+  never slows it down.
+- The rate applies in both directions: the client announces it to the proxy,
+  which applies it to what it sends on the path up to its `--max-path-rate`
+  (requests above it are capped). Without `--max-path-rate` the proxy ignores
+  such requests, since a fixed-rate path sends without congestion control.
+- `/stats` shows each path's `fixed_rate_bps`.
+
+#### In-order delivery
+
+When traffic spills from a fast path onto a slower one (or a path with more
+delay), datagrams of one flow arrive out of order. TCP inside the tunnel
+(inside WireGuard, which passes reordering through) takes that as loss:
+duplicate ACKs, spurious retransmissions and a lower sending rate. So by
+default both ends deliver each flow's datagrams in order:
+
+- The client asks for it on each flow (a `rapidmasque-sequence` request
+  header) and a rapidmasque proxy agrees; both then number the datagrams they
+  send (a rapidmasque HTTP datagram context, 4 bytes per datagram). Other
+  MASQUE peers never agree, and the flow uses plain RFC 9298 datagrams.
+- The receiver holds a datagram that arrives ahead of a gap until the gap
+  fills, or for a hold time after which it gives up on the missing one and
+  releases what it has, in order. The hold time follows how late datagrams
+  that fill a gap actually arrive (plus a quarter, up to 250 ms), and decays
+  while nothing arrives out of order; it starts at 10 ms.
+- Datagrams that come in order are never held, so a flow on one path pays
+  nothing beyond the 4 bytes; a genuinely lost datagram delays the ones after
+  it by up to the hold time.
+- `--in-order-delivery false` on the client turns it off for its flows.
 
 #### Automatic path ranking
 
@@ -535,7 +595,8 @@ pull request and publishes the report in the job summary.
 - `src/quic.rs` - noq transport config (multipath, idle/keepalive) + BoringSSL
   context setup, ECH install hooks.
 - `src/cc.rs` - congestion control choice: BBRv3 (default) or the no-op
-  controller.
+  controller, and the fixed-rate controller of `/rate=RATE` paths.
+- `src/reorder.rs` - in-order delivery of a flow's sequenced datagrams.
 - `src/tls/` - BoringSSL as noq's TLS provider: the QUIC handshake session
   (`session.rs`) and packet/header protection with the multipath nonce
   (`keys.rs`).
@@ -554,7 +615,9 @@ The client never exits: it redials the proxy indefinitely with capped
 exponential backoff (100 ms → 5 s), so a server restart, a dropped NAT mapping,
 or any transient failure recovers automatically. The local listen socket stays
 bound across reconnects, and flows reopen lazily as local datagrams arrive (apps
-retransmit lost UDP and self-heal). A 1 s keepalive (ack-eliciting) on every
+retransmit lost UDP and self-heal). With extra paths, a dial whose primary
+path does not answer within 3 s falls back to the extra paths' proxy
+addresses. A 1 s keepalive (ack-eliciting) on every
 path keeps idle NAT mappings warm and makes a dead path detectable within the
 10 s idle timeout; with multipath, losing one path does not drop the tunnel.
 
@@ -588,18 +651,19 @@ Measured over an emulated 270 ms RTT path, this takes a 2000 pkt/s
 (~19 Mbit/s) flow from ~40–60 % loss (erratic) to a stable ~3 %. Also keep the
 tunnelled interface's MTU low enough that an inner packet plus encapsulation
 fits one QUIC DATAGRAM (these cannot fragment). By default, QUIC packets start at exactly
-1352 bytes of UDP payload, which leaves the 1314 bytes of datagram room that a
+1356 bytes of UDP payload, which leaves the 1318 bytes of datagram room that a
 1280-MTU inner tunnel such as WireGuard needs from the first packet; DPLPMTUD
-can raise this to 1452 bytes, but it never drops below 1352 (black-hole
+can raise this to 1452 bytes, but it never drops below 1356 (black-hole
 detection does not shrink it). The client<->proxy path must therefore carry
-1380-byte IPv4 (1400-byte IPv6) packets; on a path that cannot, full-size
+1384-byte IPv4 (1404-byte IPv6) packets; on a path that cannot, full-size
 packets are lost rather than the tunnel quietly narrowing below what a
-1280-MTU inner tunnel needs. (The 1314 bytes assume the 8-byte connection IDs
+1280-MTU inner tunnel needs, sequence number included (see in-order
+delivery below). (The 1318 bytes assume the 8-byte connection IDs
 rapidmasque peers use; against a server issuing longer CIDs there is less
 room.)
 
 Use `--min-mtu BYTES` on `serve` and/or `client` to override the initial and
-minimum QUIC packet size for what that side sends (default 1352, minimum
+minimum QUIC packet size for what that side sends (default 1356, minimum
 1200). The value counts UDP payload bytes, excluding IP and UDP headers.
 For example, `--min-mtu 1200` supports smaller outer paths, but may require
 a smaller tunnelled interface MTU until discovery finds more room. Discovery

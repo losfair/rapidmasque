@@ -16,6 +16,7 @@ mod qpack_tables;
 mod quic;
 mod ranking;
 mod reload;
+mod reorder;
 mod routed_socket;
 mod rules;
 mod server;
@@ -99,6 +100,7 @@ fn serve(args: ServeArgs) -> Result<()> {
     let state = Arc::new(ServerState {
         rules: ArcSwap::from_pointee(rule_table),
         stats: stats_registry.clone(),
+        max_path_rate: args.max_path_rate,
     });
     let reload_paths = ReloadPaths {
         cert: args.cert.clone(),
@@ -163,6 +165,8 @@ fn client(args: ClientArgs) -> Result<()> {
             ech_config_list: load_ech_config(&args)?,
             paths: args.paths.clone(),
             primary_priority: args.primary_priority,
+            primary_rate: args.primary_rate,
+            in_order_delivery: args.in_order_delivery,
             rtable: args.rtable,
             path_ranking: args.path_ranking,
             stats: args.stats_listen.map(|_| stats::Registry::new("client")),
