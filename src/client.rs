@@ -5,7 +5,8 @@
 //! local UDP socket and acts as a UDP→CONNECT-UDP proxy, opening one flow per
 //! local source address and relaying both directions. Extra QUIC multipath
 //! paths (other local interfaces and/or proxy addresses) can be attached to the
-//! tunnel; noq then schedules datagrams across every live path.
+//! tunnel; noq then schedules datagrams across every live path, preferring
+//! paths with a lower `/priority=N`.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -16,15 +17,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
-use noq::{Connection, Endpoint, FourTuple, PathStatus, TokioRuntime};
+use noq::{Connection, Endpoint, FourTuple, PathId, PathStatus, TokioRuntime};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
-use crate::cc::CongestionControl;
 use crate::dgram;
 use crate::endpoint::Endpoint as ProxyEndpoint;
 use crate::h3::{self, FrameReader};
-use crate::quic::{self, CAPSULE_PROTOCOL_TRUE, Verify, send_datagram};
+use crate::quic::{self, CAPSULE_PROTOCOL_TRUE, TransportOptions, Verify, send_datagram};
 use crate::tls::HandshakeData;
 use crate::util::{CHANNEL_CAP, RECV_BUF, hex};
 
@@ -42,23 +42,41 @@ const PATH_RETRY_MIN: Duration = Duration::from_millis(250);
 const PATH_RETRY: Duration = Duration::from_secs(5);
 /// Consecutive failures before a down path is reported at `warn`.
 const PATH_WARN_AFTER: u32 = 3;
+/// How long the primary path's maintainer waits for the handshake path to
+/// learn its source address (see [`primary_path_spec`]).
+const PRIMARY_LOCAL_IP_WAIT: Duration = Duration::from_secs(5);
 
-/// An extra multipath path: `REMOTE_IP:PORT[@LOCAL_IP][/backup]`.
+/// An extra multipath path: `REMOTE_IP:PORT[@LOCAL_IP][/backup][/priority=N]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathSpec {
     pub remote: SocketAddr,
     pub local_ip: Option<IpAddr>,
     pub backup: bool,
+    /// Scheduling priority, lower is preferred (noq `Path::set_priority`).
+    pub priority: u8,
 }
 
 impl FromStr for PathSpec {
     type Err = String;
 
     fn from_str(s: &str) -> std::result::Result<Self, String> {
-        let (s, backup) = match s.strip_suffix("/backup") {
-            Some(rest) => (rest, true),
-            None => (s, false),
-        };
+        let mut options = s.split('/');
+        let s = options.next().unwrap_or_default();
+        let mut backup = false;
+        let mut priority = 0;
+        for option in options {
+            if option == "backup" {
+                backup = true;
+            } else if let Some(n) = option.strip_prefix("priority=") {
+                priority = n
+                    .parse()
+                    .map_err(|e| format!("bad priority {n:?} (0-255): {e}"))?;
+            } else {
+                return Err(format!(
+                    "unknown path option {option:?} (expected backup or priority=N)"
+                ));
+            }
+        }
         let (remote, local) = match s.rsplit_once('@') {
             Some((r, l)) => (r, Some(l)),
             None => (s, None),
@@ -74,6 +92,7 @@ impl FromStr for PathSpec {
             remote,
             local_ip,
             backup,
+            priority,
         })
     }
 }
@@ -86,6 +105,9 @@ impl fmt::Display for PathSpec {
         }
         if self.backup {
             write!(f, "/backup")?;
+        }
+        if self.priority != 0 {
+            write!(f, "/priority={}", self.priority)?;
         }
         Ok(())
     }
@@ -101,7 +123,9 @@ pub struct ConnectParams {
     pub ech_config_list: Option<Vec<u8>>,
     /// Extra multipath paths to attach once the tunnel is up.
     pub paths: Vec<PathSpec>,
-    pub congestion_control: CongestionControl,
+    /// Scheduling priority of the primary path (only used with `paths`).
+    pub primary_priority: u8,
+    pub transport: TransportOptions,
 }
 
 pub struct ProxyOptions {
@@ -166,8 +190,7 @@ struct Dialed {
 }
 
 async fn dial(p: &ConnectParams) -> Result<Dialed> {
-    let config =
-        quic::build_client_config(&p.verify, p.ech_config_list.clone(), p.congestion_control)?;
+    let config = quic::build_client_config(&p.verify, p.ech_config_list.clone(), p.transport)?;
     let proxy_addr = match p.proxy_addr {
         Some(addr) => addr,
         None => resolve_authority(&p.endpoint.authority)?,
@@ -264,7 +287,7 @@ async fn run_session(
         .is_some_and(|h| h.ech_accepted);
 
     // Our control stream must stay open for the connection's lifetime.
-    let _control = match h3::open_control(&conn).await {
+    let control = match h3::open_control(&conn).await {
         Ok(s) => s,
         Err(e) => {
             log::warn!("HTTP/3 setup failed: {e:#}");
@@ -276,13 +299,16 @@ async fn run_session(
     if !p.paths.is_empty() {
         // Also keep the primary path: if it is abandoned (e.g. its uplink went
         // away) while extra paths carry the tunnel, re-open it once it works.
-        let primary = PathSpec {
-            remote: proxy_addr,
-            local_ip: None,
-            backup: false,
-        };
-        for spec in std::iter::once(primary).chain(p.paths.iter().cloned()) {
-            tokio::spawn(maintain_path(conn.clone(), spec));
+        tokio::spawn({
+            let (conn, control) = (conn.clone(), control.clone());
+            let (paths, priority) = (p.paths.clone(), p.primary_priority);
+            async move {
+                let primary = primary_path_spec(&conn, proxy_addr, &paths, priority).await;
+                maintain_path(conn, primary, control).await
+            }
+        });
+        for spec in p.paths.iter().cloned() {
+            tokio::spawn(maintain_path(conn.clone(), spec, control.clone()));
         }
     }
     log::info!(
@@ -463,9 +489,59 @@ async fn route_tunnel_datagram(lsock: &UdpSocket, flows: &HashMap<u64, SocketAdd
     }
 }
 
+/// The spec that keeps the primary path (the handshake path to `proxy_addr`)
+/// open.
+///
+/// The primary path has no configured source address, and noq treats a path
+/// without one as the same path as any open path to that remote. So when an
+/// extra path also goes to `proxy_addr`, pin the primary to the source address
+/// the handshake used; otherwise its maintainer could adopt the extra path as
+/// the primary (and give it the primary's priority) and never re-open the real
+/// primary. The handshake path learns its source address from the first
+/// packets the proxy sends once the handshake is done, so wait for it briefly.
+pub(crate) async fn primary_path_spec(
+    conn: &Connection,
+    proxy_addr: SocketAddr,
+    paths: &[PathSpec],
+    priority: u8,
+) -> PathSpec {
+    let local_ip = if paths.iter().any(|spec| spec.remote == proxy_addr) {
+        let deadline = tokio::time::Instant::now() + PRIMARY_LOCAL_IP_WAIT;
+        let ip = loop {
+            let ip = conn
+                .path(PathId::ZERO)
+                .and_then(|path| path.local_ip().ok().flatten());
+            if ip.is_some()
+                || conn.close_reason().is_some()
+                || tokio::time::Instant::now() >= deadline
+            {
+                break ip;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        if ip.is_none() {
+            log::warn!(
+                "primary path's source address unknown; it may be confused with another \
+                 path to {proxy_addr}"
+            );
+        }
+        ip
+    } else {
+        None
+    };
+    PathSpec {
+        remote: proxy_addr,
+        local_ip,
+        backup: false,
+        priority,
+    }
+}
+
 /// Keep one configured multipath path open for the connection's lifetime,
-/// re-opening it whenever it fails or is abandoned.
-async fn maintain_path(conn: Connection, spec: PathSpec) {
+/// re-opening it whenever it fails or is abandoned. Each time the path comes
+/// up (a re-opened path gets a new ID), its priority is set locally and sent
+/// to the proxy, which applies it to its side of the path.
+pub(crate) async fn maintain_path(conn: Connection, spec: PathSpec, control: h3::Control) {
     if !conn.is_multipath_enabled() {
         log::warn!("proxy did not negotiate QUIC multipath; not opening path {spec}");
         return;
@@ -488,6 +564,12 @@ async fn maintain_path(conn: Connection, spec: PathSpec) {
                 if up != Some(path.id()) {
                     log::info!("multipath path {spec} up (path id {})", path.id());
                     up = Some(path.id());
+                    if let Err(e) = path.set_priority(spec.priority) {
+                        log::debug!("multipath path {spec}: setting priority: {e}");
+                    }
+                    if let Err(e) = control.send_path_priority(path.id(), spec.priority).await {
+                        log::debug!("multipath path {spec}: announcing priority: {e:#}");
+                    }
                 }
                 failures = 0;
                 delay = PATH_RETRY_MIN;
@@ -553,7 +635,20 @@ mod tests {
         let p: PathSpec = "192.0.2.1:4433@10.0.0.5/backup".parse().unwrap();
         assert_eq!(p.local_ip, Some("10.0.0.5".parse().unwrap()));
         assert!(p.backup);
+        assert_eq!(p.priority, 0);
         assert_eq!(p.to_string(), "192.0.2.1:4433@10.0.0.5/backup");
+
+        let p: PathSpec = "192.0.2.1:4433@10.0.0.5/priority=2/backup".parse().unwrap();
+        assert!(p.backup);
+        assert_eq!(p.priority, 2);
+        assert_eq!(p.to_string(), "192.0.2.1:4433@10.0.0.5/backup/priority=2");
+        assert_eq!(p.to_string().parse::<PathSpec>().unwrap(), p);
+
+        let p: PathSpec = "192.0.2.1:4433/priority=255".parse().unwrap();
+        assert_eq!(p.priority, 255);
+        assert!("192.0.2.1:4433/priority=256".parse::<PathSpec>().is_err());
+        assert!("192.0.2.1:4433/priority=".parse::<PathSpec>().is_err());
+        assert!("192.0.2.1:4433/fast".parse::<PathSpec>().is_err());
 
         let p: PathSpec = "[2001:db8::1]:443@[fe80::1]".parse().unwrap();
         assert_eq!(p.remote, "[2001:db8::1]:443".parse().unwrap());

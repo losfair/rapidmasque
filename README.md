@@ -2,7 +2,8 @@
 
 A **multipath MASQUE / CONNECT-UDP** proxy and client written in Rust, built on
 [`tokio`](https://tokio.rs), [`noq`](https://github.com/n0-computer/noq) (QUIC;
-n0's quinn fork with multipath and BBRv3) and
+n0's quinn fork with multipath and BBRv3, used from the
+[losfair/noq](https://github.com/losfair/noq) fork for path priorities) and
 [`boring`](https://github.com/cloudflare/boring) (BoringSSL). It implements the
 CONNECT-UDP protocol of [RFC 9298](https://www.rfc-editor.org/rfc/rfc9298) and
 supports **TLS certificate hot reload**, **Encrypted Client Hello (ECH)** on
@@ -20,7 +21,7 @@ key format and behavior — with these differences:
 | Runtime | monoio (io_uring / kqueue) | tokio (multi-threaded) |
 | QUIC | quiche | noq |
 | Congestion control | BBRv2 | BBRv3 per path by default; `none` opt-in |
-| Multipath | no | yes (`client --path`) |
+| Multipath | no | yes (`client --path`, with path priorities) |
 | SIGHUP hot reload | Linux only | every Unix |
 
 TLS stays on BoringSSL: rustls (noq's stock backend) cannot terminate ECH, so
@@ -188,7 +189,7 @@ rapidmasque client \
   --path '203.0.113.8:4433@10.64.0.5/backup'
 ```
 
-A path spec is `REMOTE_IP:PORT[@LOCAL_IP][/backup]`:
+A path spec is `REMOTE_IP:PORT[@LOCAL_IP][/backup][/priority=N]`:
 
 - `REMOTE_IP:PORT` - a proxy address. It may differ from the primary one (the
   proxy's IPv6 address, another address of the same host, ...); the server must
@@ -198,24 +199,61 @@ A path spec is `REMOTE_IP:PORT[@LOCAL_IP][/backup]`:
   (Wi-Fi + LTE, two ISPs). Omit it to let the OS route.
 - `/backup` - a standby path: traffic is only scheduled on it when no
   non-backup path is usable.
+- `/priority=N` - scheduling priority, 0-255, lower is preferred (default 0).
+  See [Path priority](#path-priority). The primary path's priority is
+  `--primary-priority` (default 0).
 
-The primary path (`--proxy-addr`, or the resolved endpoint host) is path 0.
+The primary path (`--proxy-addr`, or the resolved endpoint host) is the
+handshake path, path 0 (path IDs are never reused: a re-opened path gets a new
+one).
 Extra paths are opened once the tunnel is up. They, and the primary path, are
 re-opened whenever they fail or are abandoned (quick retries backing off to
 every 5 s), so a flapping uplink rejoins automatically. Every path has its own
 1 s keepalive and is abandoned after 10 s of silence; the tunnel survives as
 long as one path is alive. Path changes are logged on both ends.
 
-How traffic spreads over paths depends on congestion control. noq sends on the
-lowest-numbered usable non-backup path that has congestion-window room:
+How traffic spreads over paths depends on congestion control. noq tries the
+usable non-backup paths in priority order (lowest `priority` first, then lowest
+path ID) and sends on the first one that is not held back by its congestion
+window or pacer:
 
-- With BBRv3 (the default), traffic spills over to the next path when a
-  path's window is full, which **aggregates bandwidth** across paths.
-- With `--congestion-control none`, no window ever fills, so all traffic takes
-  the lowest-numbered usable path and the other paths are hot standbys.
+- With BBRv3 (the default), traffic spills over to the next path when a path
+  is held back, which **aggregates bandwidth** across paths. With equal
+  priorities (the default) this spreads even light traffic over all paths.
+- With `--congestion-control none`, nothing is ever held back, so all traffic
+  takes the most preferred usable path and the other paths are hot standbys.
   Multipath then means **failover**: when that path dies, traffic moves to the
   next one once the dead path is abandoned (up to the 10 s path idle timeout).
-  Use path order and `/backup` to pick the preferred uplink.
+  Use `/priority=N` and `/backup` to pick the preferred uplink.
+
+#### Path priority
+
+Give the paths different priorities to fill a preferred path first and spill
+only the excess onto the others, e.g. a good 50 Mbit/s link A as the primary
+path and a lossier 500 Mbit/s link B for overflow:
+
+```
+rapidmasque client ... \
+  --proxy-addr 203.0.113.7:4433 \
+  --path '203.0.113.7:4433@10.64.0.5/priority=1'
+```
+
+The priority applies in both directions: the client announces each path's
+priority to the proxy (a rapidmasque extension frame on the HTTP/3 control
+stream, which other HTTP/3 servers ignore), and the proxy schedules what it
+sends the same way.
+
+With BBRv3, a preferred path's pacer holds it back briefly after almost every
+packet, so without more care traffic would spill onto B even at low load.
+`--path-spill-threshold-ms` (on `serve` and `client`, default 10) sets how much
+queueing delay is accepted on the preferred path first: while A can send
+everything queued (tunnelled datagrams and stream data) within that time at
+its current BBRv3 rate, B carries no data, only its keepalives. Once the queue
+grows beyond that, or A's congestion window is full, the excess goes to B. A
+larger threshold keeps more traffic on A at the cost of latency; `0` turns the
+hold-back off. Each side's flag governs what it sends. Paths with equal
+priority always share traffic, and `/backup` paths still only carry traffic
+when no non-backup path is usable.
 
 With extra paths configured, the client binds a dual-stack `[::]:0` socket so
 IPv4 and IPv6 paths can share the connection. If the proxy does not negotiate
