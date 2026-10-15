@@ -16,6 +16,7 @@ mod qpack_tables;
 mod quic;
 mod ranking;
 mod reload;
+mod routed_socket;
 mod rules;
 mod server;
 mod stats;
@@ -129,6 +130,15 @@ fn serve(args: ServeArgs) -> Result<()> {
 
 fn client(args: ClientArgs) -> Result<()> {
     let endpoint = ProxyEndpoint::parse(&args.endpoint)?;
+    let rtables = args.rtable.is_some() || args.paths.iter().any(|p| p.rtable.is_some());
+    if rtables && !quic::RTABLE_SUPPORTED {
+        anyhow::bail!(
+            "routing tables (--rtable, --path .../rtable=N) are only supported on OpenBSD"
+        );
+    }
+    if let Some(proxy_addr) = args.proxy_addr {
+        client::validate_routing_tables(&args.paths, proxy_addr)?;
+    }
     if args.path_ranking == PathRanking::Auto {
         let max = ranking::MAX_RANKED_PRIORITY;
         if args.primary_priority > max || args.paths.iter().any(|p| p.priority > max) {
@@ -152,6 +162,7 @@ fn client(args: ClientArgs) -> Result<()> {
             ech_config_list: load_ech_config(&args)?,
             paths: args.paths.clone(),
             primary_priority: args.primary_priority,
+            rtable: args.rtable,
             path_ranking: args.path_ranking,
             stats: args.stats_listen.map(|_| stats::Registry::new("client")),
             transport: transport_options(args.congestion_control, args.path_spill_threshold_ms),

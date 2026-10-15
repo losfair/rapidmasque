@@ -189,7 +189,7 @@ rapidmasque client \
   --path '203.0.113.8:4433@10.64.0.5/backup'
 ```
 
-A path spec is `REMOTE_IP:PORT[@LOCAL_IP][/backup][/priority=N]`:
+A path spec is `REMOTE_IP:PORT[@LOCAL_IP][/backup][/priority=N][/rtable=N]`:
 
 - `REMOTE_IP:PORT` - a proxy address. It may differ from the primary one (the
   proxy's IPv6 address, another address of the same host, ...); the server must
@@ -202,6 +202,8 @@ A path spec is `REMOTE_IP:PORT[@LOCAL_IP][/backup][/priority=N]`:
 - `/priority=N` - scheduling priority, 0-255, lower is preferred (default 0).
   See [Path priority](#path-priority). The primary path's priority is
   `--primary-priority` (default 0).
+- `/rtable=N` - OpenBSD only: send the path through routing table `N`
+  (rtable(4)). See [Routing tables](#routing-tables-openbsd).
 
 The primary path (`--proxy-addr`, or the resolved endpoint host) is the
 handshake path, path 0 (path IDs are never reused: a re-opened path gets a new
@@ -284,8 +286,30 @@ It is **promoted** again once its loss recovers.
 
 Rank changes are logged on each end.
 
+#### Routing tables (OpenBSD)
+
+On OpenBSD each path can use its own routing table, e.g. to send it out a
+second uplink whose default route lives in table 1:
+
+```
+route -T 1 add default 10.64.0.1
+rapidmasque client ... --proxy-addr 203.0.113.7:4433 \
+  --path '203.0.113.7:4433@10.64.0.5/rtable=1'
+```
+
+`--rtable N` sets the table of the primary path and of every path without its
+own `/rtable` (by default, the process's table; see `route -T N exec`). The
+client binds one extra UDP socket per routing table in use (`SO_RTABLE`) and
+sends each path's packets through its table's socket; its replies come back to
+that socket. noq's packets carry only their destination and source address,
+so a path with `/rtable` needs a remote address, or a remote address plus
+`@LOCAL_IP`, that no other path (including the primary) uses. An unprivileged
+process may select any existing table while its own table is 0. Elsewhere,
+`--rtable` and `/rtable=` are rejected at startup.
+
 With extra paths configured, the client binds a dual-stack `[::]:0` socket so
-IPv4 and IPv6 paths can share the connection. If the proxy does not negotiate
+IPv4 and IPv6 paths can share the connection (on systems without dual-stack
+sockets, such as OpenBSD, a socket of the primary path's family instead). If the proxy does not negotiate
 multipath (e.g. masque-go), extra paths are skipped with a warning and the
 tunnel runs single-path.
 
@@ -449,6 +473,8 @@ multipath case (two extra paths via 127.0.0.2 / 127.0.0.3).
   maintenance.
 - `src/ranking.rs` - per-connection path priorities and automatic path
   ranking by loss (`--path-ranking auto`).
+- `src/routed_socket.rs` - the client's multi-socket noq socket for per-path
+  OpenBSD routing tables (`/rtable=N`).
 - `src/rules.rs` - the JSON endpoint→target rule table.
 - `src/stats.rs` - the optional HTTP stats endpoint (`--stats-listen`).
 - `src/quic.rs` - noq transport config (multipath, idle/keepalive) + BoringSSL

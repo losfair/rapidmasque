@@ -97,15 +97,17 @@ pub struct ClientArgs {
     pub proxy_addr: Option<SocketAddr>,
 
     /// Open an additional QUIC multipath path, as
-    /// `REMOTE_IP:PORT[@LOCAL_IP][/backup][/priority=N]`. `REMOTE` is a proxy
+    /// `REMOTE_IP:PORT[@LOCAL_IP][/backup][/priority=N][/rtable=N]`. `REMOTE` is a proxy
     /// address (it may differ from the primary one), `LOCAL_IP` pins the
     /// path's source address (e.g. a second uplink's address), and `/backup`
     /// makes it a standby path used only when no primary path works.
     /// `/priority=N` (0-255, default 0, lower is preferred) orders usable
     /// paths in both directions: traffic fills the preferred path first and
     /// spills onto the next ones (see `--path-spill-threshold-ms`); equal
-    /// priorities share traffic. Repeatable. Paths that fail are retried while
-    /// the tunnel is up.
+    /// priorities share traffic. `/rtable=N` (OpenBSD) sends the path through
+    /// routing table N (rtable(4)); such a path needs a remote, or remote and
+    /// `@LOCAL_IP`, that no other path uses. Repeatable. Paths that fail are
+    /// retried while the tunnel is up.
     #[arg(long = "path", value_name = "SPEC")]
     pub paths: Vec<PathSpec>,
 
@@ -113,6 +115,12 @@ pub struct ClientArgs {
     /// terms as `--path .../priority=N`. Only meaningful with `--path`.
     #[arg(long, value_name = "N", default_value_t = 0)]
     pub primary_priority: u8,
+
+    /// OpenBSD routing table (rtable(4)) for the primary path and every
+    /// `--path` without its own `/rtable=N`. Defaults to the process's table
+    /// (see `route -T N exec`).
+    #[arg(long, value_name = "N")]
+    pub rtable: Option<u32>,
 
     /// Rank paths by measured loss: `auto` demotes a path whose loss is
     /// clearly worse than the best path with the same priority (at least 5%,

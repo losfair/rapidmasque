@@ -21,6 +21,7 @@ use crate::endpoint::Endpoint as ProxyEndpoint;
 use crate::h3;
 use crate::quic::{self, TransportOptions, Verify, WIREGUARD_1280_DATAGRAM};
 use crate::ranking::{self, PathPriorities, RankingConfig};
+use crate::routed_socket;
 use crate::rules::RuleTable;
 use crate::server::{self, ServerState};
 use crate::stats;
@@ -106,7 +107,8 @@ fn transport(congestion_control: CongestionControl) -> TransportOptions {
 }
 
 fn client_endpoint(dual_stack: bool) -> Endpoint {
-    let socket = quic::client_bind_socket("127.0.0.1:1".parse().unwrap(), dual_stack).unwrap();
+    let socket =
+        quic::client_bind_socket("127.0.0.1:1".parse().unwrap(), dual_stack, None).unwrap();
     Endpoint::new(
         quic::endpoint_config(),
         None,
@@ -475,6 +477,92 @@ async fn lossy_path_is_demoted_and_recovers_on_both_ends() {
     wait_for(0).await;
 }
 
+/// A path routed onto its own socket (`--path .../rtable=N` on OpenBSD; here a
+/// second socket in the default table) sends and receives through that
+/// socket: the server sees it from another source port than the primary.
+#[tokio::test(flavor = "multi_thread")]
+async fn routed_path_uses_its_own_socket() {
+    let fx = Fixture::new("routed");
+    let server = fx.server(HOST);
+    let server_addr = server.local_addr().unwrap();
+    let (server_tx, server_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let _ = server_tx.send(conn.clone());
+        while let Ok(d) = conn.read_datagram().await {
+            let _ = conn.send_datagram(d);
+        }
+    });
+
+    let extra_local: std::net::IpAddr = "127.0.0.2".parse().unwrap();
+    let socket = quic::client_bind_socket(server_addr, true, None).unwrap();
+    let routed = routed_socket::build(
+        socket,
+        &[routed_socket::Route {
+            remote: server_addr,
+            local_ip: Some(extra_local),
+            rtable: None,
+        }],
+    )
+    .unwrap();
+    let client = Endpoint::new_with_abstract_socket(
+        quic::endpoint_config(),
+        None,
+        routed,
+        Arc::new(TokioRuntime),
+    )
+    .unwrap();
+    let conn = client
+        .connect_with(fx.client_config(false), server_addr, HOST)
+        .unwrap()
+        .await
+        .unwrap();
+    let server_conn = server_rx.await.unwrap();
+
+    let tuple = FourTuple::new(server_addr, Some(extra_local));
+    let mut path = None;
+    for _ in 0..40 {
+        match conn.open_path_ensure(tuple, PathStatus::Available).await {
+            Ok(p) => {
+                path = Some(p);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    let path = path.expect("routed path must open");
+    conn.path(noq::PathId::ZERO)
+        .unwrap()
+        .set_status(PathStatus::Backup)
+        .unwrap();
+    conn.send_datagram(bytes::Bytes::from_static(b"routed"))
+        .unwrap();
+    let echoed = tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&echoed[..], b"routed");
+    assert!(
+        path.stats().udp_rx.datagrams > 0,
+        "replies arrive on the routed socket"
+    );
+
+    let remote_of = |id| {
+        server_conn
+            .path(id)
+            .and_then(|p| p.remote_address().ok())
+            .map(canonical)
+            .unwrap()
+    };
+    let (primary, routed) = (remote_of(noq::PathId::ZERO), remote_of(path.id()));
+    assert_eq!(routed.ip(), extra_local);
+    assert_ne!(
+        primary.port(),
+        routed.port(),
+        "the routed path must leave through its own socket"
+    );
+}
+
 async fn udp_echo() -> SocketAddr {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = sock.local_addr().unwrap();
@@ -552,6 +640,7 @@ async fn start_tunnel(
             ech_config_list: Some(fx.ech_list.clone()),
             paths: paths(proxy_addr),
             primary_priority: 0,
+            rtable: None,
             path_ranking: Default::default(),
             stats: client_stats,
             transport: transport(CongestionControl::None),

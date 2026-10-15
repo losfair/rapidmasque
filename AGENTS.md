@@ -74,6 +74,16 @@ and documented in `README.md`.
   has no path list API: path IDs are sequential and never reused, so the
   ranker scans IDs above the highest seen. Do not rank on smoothed RTT (it
   tracks the path's own queueing and flaps).
+- `src/routed_socket.rs` implements per-path OpenBSD routing tables
+  (`--path .../rtable=N`, `--rtable`): noq runs all paths over one
+  `AsyncUdpSocket`, so `RoutedUdpSocket` wraps the default socket plus one
+  socket per routing table (`SO_RTABLE`, set before bind) and routes each
+  `Transmit` by destination + source IP (canonicalised; noq uses IPv4-mapped
+  addresses on dual-stack sockets). It is tested on Linux with a second
+  default-table socket (`Route::rtable: None`); the OpenBSD smoke test
+  (`.github/scripts/smoke-test.sh`) exercises a real `rtable=0` path. OpenBSD
+  has no dual-stack sockets: `quic::client_bind_socket` falls back to the
+  primary's family there.
 - `src/stats.rs` is the optional `--stats-listen` endpoint: a minimal
   hand-written HTTP/1.1 responder (no HTTP crate) serving `GET /stats` JSON
   from a `Registry` of live connections (server and client register each

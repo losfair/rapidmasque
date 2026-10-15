@@ -125,6 +125,22 @@ pub(crate) fn enlarge_udp_buffers(sock: &impl std::os::fd::AsRawFd) {
 /// unspecified IPv6 address is bound dual-stack so multipath can mix IPv4 and
 /// IPv6 paths on one endpoint.
 pub(crate) fn bind_endpoint_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {
+    bind_endpoint_socket_in(addr, None)
+}
+
+/// [`bind_endpoint_socket`] in OpenBSD routing table `rtable` (`SO_RTABLE`,
+/// which must be set before binding), if given.
+pub(crate) fn bind_endpoint_socket_in(
+    addr: SocketAddr,
+    rtable: Option<u32>,
+) -> Result<std::net::UdpSocket> {
+    bind_socket(addr, rtable).map(|(sock, _)| sock)
+}
+
+/// Bind as [`bind_endpoint_socket_in`]; also returns whether the socket is
+/// dual-stack (an unspecified IPv6 address that also carries IPv4). Some
+/// systems, e.g. OpenBSD, have no dual-stack sockets.
+fn bind_socket(addr: SocketAddr, rtable: Option<u32>) -> Result<(std::net::UdpSocket, bool)> {
     use socket2::{Domain, Protocol, Socket, Type};
     let domain = if addr.is_ipv4() {
         Domain::IPV4
@@ -133,25 +149,29 @@ pub(crate) fn bind_endpoint_socket(addr: SocketAddr) -> Result<std::net::UdpSock
     };
     let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
         .with_context(|| format!("creating UDP socket for {addr}"))?;
-    if let SocketAddr::V6(v6) = addr
-        && v6.ip().is_unspecified()
-    {
-        let _ = sock.set_only_v6(false);
-    }
+    let dual_stack = matches!(addr, SocketAddr::V6(v6) if v6.ip().is_unspecified())
+        && sock.set_only_v6(false).is_ok()
+        && sock.only_v6().is_ok_and(|only| !only);
     enlarge_udp_buffers(&sock);
+    if let Some(rtable) = rtable {
+        set_rtable(&sock, rtable).with_context(|| format!("selecting routing table {rtable}"))?;
+    }
     sock.bind(&addr.into())
         .with_context(|| format!("binding UDP {addr}"))?;
-    Ok(sock.into())
+    Ok((sock.into(), dual_stack))
 }
 
 /// The unspecified address to bind a client endpoint on. With extra multipath
-/// paths configured this is dual-stack `[::]:0` (falling back to the primary
-/// family if IPv6 is unavailable).
+/// paths configured this is dual-stack `[::]:0`, falling back to the primary
+/// family where IPv6 or dual-stack sockets are unavailable (OpenBSD has none:
+/// an IPv6 socket there cannot reach IPv4 peers). `rtable` selects its OpenBSD
+/// routing table.
 pub(crate) fn client_bind_socket(
     primary: SocketAddr,
     dual_stack: bool,
+    rtable: Option<u32>,
 ) -> Result<std::net::UdpSocket> {
-    if dual_stack && let Ok(s) = bind_endpoint_socket((Ipv6Addr::UNSPECIFIED, 0).into()) {
+    if dual_stack && let Ok((s, true)) = bind_socket((Ipv6Addr::UNSPECIFIED, 0).into(), rtable) {
         return Ok(s);
     }
     let bind: SocketAddr = if primary.is_ipv4() {
@@ -159,7 +179,29 @@ pub(crate) fn client_bind_socket(
     } else {
         "[::]:0".parse().unwrap()
     };
-    bind_endpoint_socket(bind)
+    bind_endpoint_socket_in(bind, rtable)
+}
+
+/// Whether routing tables (`SO_RTABLE`) are supported here: OpenBSD only.
+pub(crate) const RTABLE_SUPPORTED: bool = cfg!(target_os = "openbsd");
+
+/// Put a socket in OpenBSD routing table `rtable` (rtable(4)). Must happen
+/// before `bind`. Unprivileged processes may select any existing table while
+/// their own is 0.
+#[cfg(target_os = "openbsd")]
+fn set_rtable(sock: &socket2::Socket, rtable: u32) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let rtable = libc::c_int::try_from(rtable)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    set_sockopt_int(sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RTABLE, rtable)
+}
+
+#[cfg(not(target_os = "openbsd"))]
+fn set_rtable(_sock: &socket2::Socket, _rtable: u32) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "routing tables (SO_RTABLE) are only supported on OpenBSD",
+    ))
 }
 
 /// Endpoint-level config: QUIC v1 only (the BoringSSL backend's version).
