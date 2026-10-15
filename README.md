@@ -404,9 +404,10 @@ tunnelled interface's MTU low enough that an inner packet plus encapsulation
 fits one QUIC DATAGRAM (these cannot fragment). QUIC packets start at 1400 bytes
 of UDP payload (~1362 bytes of datagram room), enough for a 1280-MTU inner
 tunnel such as WireGuard (1314-byte datagrams) from the first packet; DPLPMTUD
-can raise this to 1452 bytes. The client<->proxy path must therefore carry
-~1450-byte IP packets. On paths that cannot, noq falls back toward 1200 bytes
-and inner packets that no longer fit are dropped with a warning.
+can raise this to 1452 bytes, but it never drops below 1400 (black-hole
+detection does not shrink it). The client<->proxy path must therefore carry
+~1450-byte IP packets; on a path that cannot, full-size packets are lost rather
+than the tunnel quietly narrowing below what a 1280-MTU inner tunnel needs.
 
 BBRv3 (the default) paces and models the bottleneck. With
 `--congestion-control none`, bursts go out unpaced as fast as the socket accepts
