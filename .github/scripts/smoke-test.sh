@@ -136,45 +136,44 @@ if [ "$(uname -s)" = OpenBSD ]; then
         ifconfig
         exit 1
     fi
-    # The same extra path without a routing table first, to tell multipath
-    # problems from routing-table ones.
-    check multipath 6005 --path "$egress_ip:4433"
-    # Diagnostics for this check, shown if it fails: syscall traces of the
-    # server and the client, packet captures and the UDP counters.
-    ktrace -t c -f "$work/server.ktrace" -p "$server_pid" || true
     egress_if="$(ifconfig egress | sed -n '1s/:.*//p')"
     for ifc in lo0 "$egress_if"; do
         sudo tcpdump -n -l -i "$ifc" udp port 4433 > "$work/tcpdump-$ifc.txt" 2>&1 &
     done
     netstat -s -p udp > "$work/udpstat.before" 2>&1 || true
-    sleep 1
     spec="$egress_ip:4433/rtable=0"
-    ktrace -t c -f "$work/client.ktrace" "$bin" client --listen 127.0.0.1:6003 \
-        --endpoint https://localhost:4433/connect --proxy-addr 127.0.0.1:4433 \
-        --stats-listen 127.0.0.1:7003 \
-        --insecure --path "$spec" > "$work/client-rtable-up.log" 2>&1 &
-    cpid=$!
-    pids="$pids $cpid"
-    # The path must come up and receive through its own socket.
-    i=0
-    until grep -q "multipath path $spec up" "$work/client-rtable-up.log" &&
-        [ "$(path_rx 7003 "$egress_ip:4433")" -gt 0 ] 2>/dev/null; do
-        i=$((i + 1))
-        if [ $i -gt 15 ]; then
-            echo "FAIL: path $spec did not come up and receive"
-            diagnose "$cpid" 7003
-            show_logs "$work/client-rtable-up.log"
+    for round in 1 2 3; do
+        # The same extra path without a routing table first, to tell
+        # multipath problems from routing-table ones.
+        check "multipath-$round" 6005 --path "$egress_ip:4433"
+        "$bin" client --listen 127.0.0.1:6003 \
+            --endpoint https://localhost:4433/connect --proxy-addr 127.0.0.1:4433 \
+            --stats-listen 127.0.0.1:7003 \
+            --insecure --path "$spec" > "$work/client-rtable-up-$round.log" 2>&1 &
+        cpid=$!
+        pids="$pids $cpid"
+        # The path must come up and receive through its own socket.
+        i=0
+        until grep -q "multipath path $spec up" "$work/client-rtable-up-$round.log" &&
+            [ "$(path_rx 7003 "$egress_ip:4433")" -gt 0 ] 2>/dev/null; do
+            i=$((i + 1))
+            if [ $i -gt 15 ]; then
+                echo "FAIL: path $spec did not come up and receive (round $round)"
+                ktrace -t c -f "$work/server.ktrace" -p "$server_pid" || true
+                diagnose "$cpid" 7003
+                ktrace -C || true
+                show_logs "$work/client-rtable-up-$round.log"
+                exit 1
+            fi
+            sleep 1
+        done
+        grep -q "routing table 0: socket" "$work/client-rtable-up-$round.log" || {
+            echo "FAIL: no routing-table socket"
+            cat "$work/client-rtable-up-$round.log"
             exit 1
-        fi
-        sleep 1
+        }
+        echo "PASS: path in routing table 0 up and receiving after ${i}s (round $round)"
+        kill "$cpid" 2>/dev/null || true
     done
-    ktrace -C || true
-    grep -q "routing table 0: socket" "$work/client-rtable-up.log" || {
-        echo "FAIL: no routing-table socket"
-        cat "$work/client-rtable-up.log"
-        exit 1
-    }
-    echo "PASS: path in routing table 0 up and receiving"
-    kill "$cpid" 2>/dev/null || true
     check rtable 6004 --path "$spec"
 fi
