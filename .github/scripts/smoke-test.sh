@@ -29,7 +29,7 @@ test -n "$ech"
 
 "$tools/udpecho" 127.0.0.1:5390 > /dev/null 2>&1 &
 pids="$pids $!"
-"$bin" serve --addr 0.0.0.0:4433 --rules "$work/rules.json" \
+RUST_LOG=debug "$bin" serve --addr 0.0.0.0:4433 --rules "$work/rules.json" \
     --cert "$work/cert.pem" --key "$work/key.pem" --ech-key "$work/ech.pem" \
     --stats-listen 127.0.0.1:9100 \
     > "$work/server.log" 2>&1 &
@@ -40,15 +40,21 @@ sleep 2
 # diagnose PID STATS_PORT: what a stuck client is doing (OpenBSD only).
 diagnose() {
     [ "$(uname -s)" = OpenBSD ] || return 0
-    echo "--- client process"; ps -o pid,pcpu,state,wchan,command -p "$1" || true
+    echo "--- processes"; ps -o pid,pcpu,state,wchan,command -p "$1,$server_pid" || true
     echo "--- client stats"; ftp -V -o - "http://127.0.0.1:$2/stats" 2>&1 || true
     echo "--- server stats"; ftp -V -o - "http://127.0.0.1:9100/stats" 2>&1 || true
-    echo "--- client syscalls (2 s)"
-    if ktrace -f "$work/ktrace.out" -t cn -p "$1"; then
-        sleep 2
-        ktrace -C || true
-        kdump -f "$work/ktrace.out" | tail -n 60
-    fi
+    echo "--- client and server syscalls (2 s)"
+    ktrace -f "$work/client-diag.ktrace" -t c -p "$1" || true
+    ktrace -f "$work/server-diag.ktrace" -t c -p "$server_pid" || true
+    sleep 2
+    ktrace -C || true
+    for side in client server; do
+        echo "--- $side syscalls"
+        kdump -f "$work/$side-diag.ktrace" > "$work/$side-diag.txt" 2>/dev/null || true
+        awk '$3 == "CALL" { sub(/\(.*/, "", $4); print $4 }' "$work/$side-diag.txt" | sort | uniq -c | sort -rn
+        grep -E 'RET +[a-z_]+ -1' "$work/$side-diag.txt" | sort | uniq -c | sort -rn | head -n 20
+        grep -E 'sendmsg|recvmsg' "$work/$side-diag.txt" | tail -n 30
+    done
     echo "--- udp sockets"; netstat -an -f inet -p udp || true
     echo "--- plain UDP over loopback (to the echo target)"
     "$tools/udpsend" 127.0.0.1:5390 probe 2>&1 || true
@@ -77,14 +83,6 @@ show_logs() {
     for cap in "$work"/tcpdump-*.txt; do
         [ -f "$cap" ] || continue
         echo "--- $(basename "$cap")"; tail -n 100 "$cap"
-    done
-    for kt in "$work"/*.ktrace; do
-        [ -f "$kt" ] || continue
-        echo "--- $(basename "$kt"): socket syscalls, failures, last calls"
-        kdump -f "$kt" > "$kt.txt" 2>/dev/null || true
-        grep -E 'CALL +(sendmsg|recvmsg|sendto|recvfrom)' "$kt.txt" | awk '{print $4}' | sed 's/(.*//' | sort | uniq -c
-        grep -E -A1 'CALL +(sendmsg|recvmsg)' "$kt.txt" | grep -E 'RET +(sendmsg|recvmsg) -1' | sort | uniq -c
-        grep -E 'sendmsg|recvmsg' "$kt.txt" | tail -n 40
     done
     if [ -f "$work/udpstat.before" ]; then
         echo "--- UDP counters, before and now"
@@ -177,9 +175,7 @@ if [ "$(uname -s)" = OpenBSD ]; then
             if [ $i -gt 15 ]; then
                 echo "FAIL: path $spec did not come up and receive (round $round)"
                 port=6003
-                ktrace -t c -f "$work/server.ktrace" -p "$server_pid" || true
                 diagnose "$cpid" 7003
-                ktrace -C || true
                 show_logs "$work/client-rtable-up-$round.log"
                 exit 1
             fi
