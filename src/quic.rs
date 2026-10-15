@@ -438,7 +438,10 @@ pub(crate) async fn log_path_events(conn: noq::Connection) {
         match ev {
             None => return,
             Some(Ok(noq::PathEvent::Established { id: path, .. })) => {
-                let remote = conn.path(path).and_then(|p| p.remote_address().ok());
+                let remote = conn
+                    .path(path)
+                    .and_then(|p| p.remote_address().ok())
+                    .map(crate::util::canonical);
                 log::info!("connection {id}: path {path} established ({remote:?})");
             }
             Some(Ok(noq::PathEvent::Abandoned {

@@ -20,7 +20,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::quic::PathScan;
 use crate::ranking::PathPriorities;
-use crate::util::path_id_u32;
+use crate::util::{canonical, path_id_u32};
 
 /// Largest request head accepted.
 const MAX_REQUEST: usize = 8 * 1024;
@@ -136,8 +136,8 @@ fn connection_stats(entry: &Entry) -> Value {
             let entry = priorities.get(&path.id()).copied().unwrap_or_default();
             json!({
                 "id": path_id_u32(path.id()),
-                "remote": path.remote_address().ok().map(|a| a.to_string()),
-                "local_ip": path.local_ip().ok().flatten().map(|a| a.to_string()),
+                "remote": path.remote_address().ok().map(|a| canonical(a).to_string()),
+                "local_ip": path.local_ip().ok().flatten().map(|a| a.to_canonical().to_string()),
                 "status": match path.status() {
                     Ok(PathStatus::Available) => Some("available"),
                     Ok(PathStatus::Backup) => Some("backup"),

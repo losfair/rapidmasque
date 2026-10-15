@@ -25,6 +25,7 @@ use crate::rules::RuleTable;
 use crate::server::{self, ServerState};
 use crate::stats;
 use crate::tls::HandshakeData;
+use crate::util::canonical;
 
 /// The certificate from `ech_test::self_signed` covers this name.
 const HOST: &str = "secret.internal";
@@ -351,11 +352,12 @@ async fn lossy_relay(upstream: SocketAddr, loss_permille: Arc<AtomicU32>) -> Soc
     addr
 }
 
-/// The local priority of the path to `remote`, if open.
+/// The local priority of the path to `remote`, if open. On a dual-stack
+/// client socket noq reports IPv4 remotes in IPv4-mapped form.
 fn priority_towards(conn: &noq::Connection, remote: SocketAddr) -> Option<u8> {
     (0..4 * quic::MAX_PATHS)
         .filter_map(|id| conn.path(noq::PathId::from(id)))
-        .find(|p| p.remote_address().ok() == Some(remote))
+        .find(|p| p.remote_address().ok().map(canonical) == Some(canonical(remote)))
         .and_then(|p| p.priority().ok())
 }
 
