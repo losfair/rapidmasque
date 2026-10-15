@@ -30,17 +30,35 @@ test -n "$ech"
 pids="$pids $!"
 "$bin" serve --addr 0.0.0.0:4433 --rules "$work/rules.json" \
     --cert "$work/cert.pem" --key "$work/key.pem" --ech-key "$work/ech.pem" \
+    --stats-listen 127.0.0.1:9100 \
     > "$work/server.log" 2>&1 &
 pids="$pids $!"
 sleep 2
+
+# diagnose PID STATS_PORT: what a stuck client is doing (OpenBSD only).
+diagnose() {
+    [ "$(uname -s)" = OpenBSD ] || return 0
+    echo "--- client process"; ps -o pid,pcpu,state,wchan,command -p "$1" || true
+    echo "--- client stats"; ftp -V -o - "http://127.0.0.1:$2/stats" 2>&1 || true
+    echo "--- server stats"; ftp -V -o - "http://127.0.0.1:9100/stats" 2>&1 || true
+    echo "--- client syscalls (2 s)"
+    if ktrace -f "$work/ktrace.out" -t cn -p "$1"; then
+        sleep 2
+        ktrace -C || true
+        kdump -f "$work/ktrace.out" | tail -n 60
+    fi
+    echo "--- udp sockets"; netstat -an -f inet -p udp || true
+}
 
 # check NAME PORT [CLIENT_ARGS...]: tunnel one datagram through a fresh client.
 check() {
     name="$1"
     port="$2"
     shift 2
+    stats=$((port + 1000))
     "$bin" client --listen "127.0.0.1:$port" \
         --endpoint https://localhost:4433/connect --proxy-addr 127.0.0.1:4433 \
+        --stats-listen "127.0.0.1:$stats" \
         --insecure "$@" > "$work/client-$name.log" 2>&1 &
     cpid=$!
     pids="$pids $cpid"
@@ -54,13 +72,15 @@ check() {
         i=$((i + 1))
         sleep 1
     done
-    kill "$cpid" 2>/dev/null || true
     if [ -z "$ok" ]; then
         echo "FAIL: $name"
+        diagnose "$cpid" "$stats"
+        kill "$cpid" 2>/dev/null || true
         echo "--- server log"; cat "$work/server.log"
         echo "--- client log"; cat "$work/client-$name.log"
         exit 1
     fi
+    kill "$cpid" 2>/dev/null || true
     echo "PASS: $name"
 }
 
@@ -83,26 +103,31 @@ if [ "$(uname -s)" = OpenBSD ]; then
         ifconfig
         exit 1
     fi
+    # The same extra path without a routing table first, to tell multipath
+    # problems from routing-table ones.
+    check multipath 6005 --path "$egress_ip:4433"
     spec="$egress_ip:4433/rtable=0"
     "$bin" client --listen 127.0.0.1:6003 \
         --endpoint https://localhost:4433/connect --proxy-addr 127.0.0.1:4433 \
-        --insecure --path "$spec" > "$work/client-rtable.log" 2>&1 &
+        --stats-listen 127.0.0.1:7003 \
+        --insecure --path "$spec" > "$work/client-rtable-up.log" 2>&1 &
     cpid=$!
     pids="$pids $cpid"
     i=0
-    until grep -q "multipath path $spec up" "$work/client-rtable.log"; do
+    until grep -q "multipath path $spec up" "$work/client-rtable-up.log"; do
         i=$((i + 1))
         if [ $i -gt 10 ]; then
             echo "FAIL: path $spec did not come up"
+            diagnose "$cpid" 7003
             echo "--- server log"; cat "$work/server.log"
-            echo "--- client log"; cat "$work/client-rtable.log"
+            echo "--- client log"; cat "$work/client-rtable-up.log"
             exit 1
         fi
         sleep 1
     done
-    grep -q "routing table 0: socket" "$work/client-rtable.log" || {
+    grep -q "routing table 0: socket" "$work/client-rtable-up.log" || {
         echo "FAIL: no routing-table socket"
-        cat "$work/client-rtable.log"
+        cat "$work/client-rtable-up.log"
         exit 1
     }
     kill "$cpid" 2>/dev/null || true
