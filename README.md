@@ -201,9 +201,15 @@ behind. So each side manages its queue (on `serve` and `client`):
   on loss (e.g. constant-rate UDP above the path's rate) too slowly; without
   the limit it would still queue up to the buffer size.
 
+These values are for paths with a round-trip time of up to the interval. On
+longer paths all three scale up with the largest minimum RTT among the
+tunnel's paths (`--datagram-queue-scale-with-rtt`, default on): about 13.5,
+270 and 540 ms on a 270 ms path. CoDel's interval must be at least the RTT of
+the flows it drops for; in the netem testbed a fixed 100 ms interval on a
+270 ms path made tunnelled TCP retransmit ~6x as much for no latency gain.
+
 `--datagram-queue-target-ms 0` turns queue management off, and
-`--datagram-queue-max-ms 0` removes the hard limit. For tunnelled flows with
-long round trips, an interval closer to their RTT lets larger bursts drain.
+`--datagram-queue-max-ms 0` removes the hard limit.
 The stats endpoint counts drops per connection (`datagrams_dropped_delay`,
 and `datagrams_dropped_overflow` for a full buffer).
 
@@ -510,8 +516,10 @@ sudo WIREGUARD_GO=/path/to/wireguard-go testing/netem/netem-bench.sh
 It runs the production stack, TCP (iperf3) inside WireGuard (MTU 1280) inside
 a rapidmasque tunnel, between two network namespaces whose link is shaped with
 netem: 20 Mbit/s at 270 ms RTT with and without 1% loss, and 50 Mbit/s at
-20 ms RTT. Each link is measured with the defaults, without datagram queue
-management, and with `--congestion-control none`, reporting TCP goodput and
+20 ms RTT. Each link is measured with the defaults, with a fixed (not
+RTT-scaled) queue management interval, without datagram queue management, and
+with `--congestion-control none` (`REPEATS=n` reports medians over n runs),
+reporting TCP goodput and
 retransmits, the latency of a ping alongside the load, and the tunnel's drop
 counters (`target/netem/report.md`). The `netem` CI workflow runs it on every
 pull request and publishes the report in the job summary.

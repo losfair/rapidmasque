@@ -16,6 +16,9 @@ on:
       duration:
         description: Seconds of load per run
         default: "20"
+      repeats:
+        description: Runs per cell (the report shows medians)
+        default: "2"
 
 env:
   CARGO_TERM_COLOR: always
@@ -62,7 +65,8 @@ jobs:
       - name: Run the testbed
         run: |
           sudo env WIREGUARD_GO="$PWD/out/bin/wireguard" GENCERT="$PWD/out/bin/gencert" \
-            DURATION="${{ inputs.duration || '20' }}" DIRECTIONS="download upload" \
+            DURATION="${{ inputs.duration || '20' }}" REPEATS="${{ inputs.repeats || '2' }}" \
+            DIRECTIONS="download upload" \
             testing/netem/netem-bench.sh "$PWD/out/netem"
 
       - name: Report

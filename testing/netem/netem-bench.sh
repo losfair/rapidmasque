@@ -22,8 +22,9 @@
 #   GENCERT       testing/gencert.go binary (default: built with go)
 #   DURATION      seconds of load per run (default 20)
 #   SCENARIOS     subset of: hirtt hirtt-loss lowrtt (default: all)
-#   VARIANTS      subset of: default no-aqm cc-none (default: all)
+#   VARIANTS      subset of: default codel-fixed no-aqm cc-none (default: all)
 #   DIRECTIONS    subset of: download upload (default: download)
+#   REPEATS       runs per cell; the report shows medians (default 1)
 #   BUF_MS        bottleneck buffer beyond the delay line, in ms at line rate
 #                 (default 100)
 #   ALLOW_TBF=1   where the kernel has no netem, shape with tbf instead (rate
@@ -40,8 +41,9 @@ RAPIDMASQUE="${RAPIDMASQUE:-$ROOT/target/release/rapidmasque}"
 WIREGUARD_GO="${WIREGUARD_GO:-$(command -v wireguard-go || true)}"
 DURATION="${DURATION:-20}"
 SCENARIOS="${SCENARIOS:-hirtt hirtt-loss lowrtt}"
-VARIANTS="${VARIANTS:-default no-aqm cc-none}"
+VARIANTS="${VARIANTS:-default codel-fixed no-aqm cc-none}"
 DIRECTIONS="${DIRECTIONS:-download}"
+REPEATS="${REPEATS:-1}"
 BUF_MS="${BUF_MS:-100}"
 
 NSC=rmq-c
@@ -65,6 +67,8 @@ scenario() {
 variant() {
     case "$1" in
         default) echo "" ;;
+        # Queue management with a fixed (not RTT-scaled) 100 ms interval.
+        codel-fixed) echo "--datagram-queue-scale-with-rtt false" ;;
         no-aqm) echo "--datagram-queue-target-ms 0 --datagram-queue-max-ms 0" ;;
         cc-none) echo "--congestion-control none" ;;
         *) echo "unknown variant $1" >&2; exit 2 ;;
@@ -185,10 +189,10 @@ nsc ip link set wgc mtu 1280 up
 nss iperf3 -s -B 10.99.0.2 >/dev/null 2>&1 &
 IPERF_PID=$!
 
-# run SCENARIO VARIANT DIRECTION: one measurement, results in $OUT/<name>/.
+# run SCENARIO VARIANT DIRECTION REPEAT: one measurement, in $OUT/<name>/.
 run() {
-    local scen=$1 var=$2 dir=$3
-    local name="$scen.$var.$dir" flags
+    local scen=$1 var=$2 dir=$3 rep=$4
+    local name="$scen.$var.$dir.r$rep" flags
     local d="$OUT/$name"
     rm -rf "$d"
     mkdir -p "$d"
@@ -237,10 +241,14 @@ run() {
 
 echo "== runs ($SHAPER, ${DURATION}s each) =="
 failed=0
-for scen in $SCENARIOS; do
-    for var in $VARIANTS; do
-        for dir in $DIRECTIONS; do
-            run "$scen" "$var" "$dir" || failed=$((failed + 1))
+# Repeats run as whole rounds, so slow drift on the runner spreads over all
+# cells instead of biasing one.
+for rep in $(seq "$REPEATS"); do
+    for scen in $SCENARIOS; do
+        for var in $VARIANTS; do
+            for dir in $DIRECTIONS; do
+                run "$scen" "$var" "$dir" "$rep" || failed=$((failed + 1))
+            done
         done
     done
 done

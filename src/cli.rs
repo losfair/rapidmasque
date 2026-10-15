@@ -197,9 +197,9 @@ pub struct TransportArgs {
     pub datagram_queue_target_ms: u64,
 
     /// How long (milliseconds) the queueing delay may stay above
-    /// `--datagram-queue-target-ms` before dropping starts. On the order of
-    /// the tunnelled flows' round-trip time; raise it for long paths so
-    /// bursts have time to drain.
+    /// `--datagram-queue-target-ms` before dropping starts. It should be at
+    /// least the tunnelled flows' round-trip time; see
+    /// `--datagram-queue-scale-with-rtt`.
     #[arg(long, value_name = "MS", default_value_t = DEFAULT_DATAGRAM_QUEUE_INTERVAL.as_millis() as u64, value_parser = clap::value_parser!(u64).range(1..))]
     pub datagram_queue_interval_ms: u64,
 
@@ -209,6 +209,14 @@ pub struct TransportArgs {
     /// CoDel alone sheds too slowly. `0` removes the limit.
     #[arg(long, value_name = "MS", default_value_t = DEFAULT_DATAGRAM_QUEUE_MAX.as_millis() as u64)]
     pub datagram_queue_max_ms: u64,
+
+    /// Scale the target, interval and hard limit up for paths with a longer
+    /// round-trip time than the interval, in proportion to the largest
+    /// minimum RTT among the tunnel's paths (e.g. 13.5 / 270 / 540 ms at
+    /// 270 ms with the defaults). A fixed interval shorter than the RTT drops
+    /// again before tunnelled TCP could react to the previous drop.
+    #[arg(long, value_name = "BOOL", default_value_t = true, action = clap::ArgAction::Set)]
+    pub datagram_queue_scale_with_rtt: bool,
 }
 
 impl TransportArgs {
@@ -230,6 +238,7 @@ impl TransportArgs {
                 interval: Duration::from_millis(self.datagram_queue_interval_ms),
                 max_delay: (self.datagram_queue_max_ms > 0)
                     .then(|| Duration::from_millis(self.datagram_queue_max_ms)),
+                scale_with_rtt: self.datagram_queue_scale_with_rtt,
             }),
         })
     }
@@ -277,6 +286,7 @@ mod tests {
                 target: Duration::from_millis(5),
                 interval: Duration::from_millis(100),
                 max_delay: Some(Duration::from_millis(200)),
+                scale_with_rtt: true,
             })
         );
         let parse = |flags: &[&str]| {
@@ -323,5 +333,8 @@ mod tests {
         assert_eq!(options.datagram_codel, None);
         assert_eq!(options.path_spill_threshold, None);
         assert!(parse(&["--datagram-queue-interval-ms", "0"]).is_err());
+        let args = parse(&["--datagram-queue-scale-with-rtt", "false"]).unwrap();
+        let codel = args.transport.options().unwrap().datagram_codel.unwrap();
+        assert!(!codel.scale_with_rtt);
     }
 }
