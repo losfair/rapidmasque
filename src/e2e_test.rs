@@ -17,7 +17,7 @@ use crate::client::{self, ConnectParams, PathSpec, ProxyOptions};
 use crate::ech::key::EchKeySet;
 use crate::ech_test::{ech_config_list_and_key_set, self_signed};
 use crate::endpoint::Endpoint as ProxyEndpoint;
-use crate::quic::{self, Verify};
+use crate::quic::{self, Verify, WIREGUARD_1280_DATAGRAM};
 use crate::rules::RuleTable;
 use crate::server::{self, ServerState};
 use crate::tls::HandshakeData;
@@ -423,7 +423,6 @@ async fn wireguard_1280_fits_right_after_handshake() {
         .unwrap()
         .await
         .unwrap();
-    const WIREGUARD_1280_DATAGRAM: usize = 1280 + 32 + 2;
     let client_max = conn.max_datagram_size().unwrap();
     assert!(
         client_max >= WIREGUARD_1280_DATAGRAM,
@@ -492,5 +491,8 @@ async fn idle_extra_path_stays_up_and_fits_wireguard() {
         path.id()
     );
     let room = conn.max_datagram_size().unwrap();
-    assert!(room >= 1280 + 32 + 2, "datagram room {room} with two paths");
+    assert!(
+        room >= WIREGUARD_1280_DATAGRAM,
+        "datagram room {room} with two paths"
+    );
 }
