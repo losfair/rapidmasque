@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use crate::cc::CongestionControl;
 use crate::client::PathSpec;
 use crate::quic::DEFAULT_PATH_SPILL_THRESHOLD;
+use crate::ranking::PathRanking;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Multipath MASQUE (CONNECT-UDP) proxy and client", long_about = None)]
@@ -105,6 +106,16 @@ pub struct ClientArgs {
     /// terms as `--path .../priority=N`. Only meaningful with `--path`.
     #[arg(long, value_name = "N", default_value_t = 0)]
     pub primary_priority: u8,
+
+    /// Rank paths by measured loss: `auto` demotes a path whose loss is
+    /// clearly worse than the best path with the same priority (at least 5%,
+    /// and 3 points above the best, for 3 samples in a row), so traffic moves
+    /// to the better paths of that priority; it is promoted again once its
+    /// loss recovers. The proxy does the same for what it sends. Paths never
+    /// move across configured priorities, which must then be at most 127.
+    /// Only meaningful with `--path`.
+    #[arg(long, value_enum, default_value_t = PathRanking::Off)]
+    pub path_ranking: PathRanking,
 
     /// Skip TLS certificate verification (testing only).
     #[arg(long)]

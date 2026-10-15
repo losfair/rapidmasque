@@ -64,6 +64,16 @@ and documented in `README.md`.
   announces them to the server with the `FRAME_PATH_PRIORITY` extension frame
   on its HTTP/3 control stream (`src/h3.rs`); the server applies them to its
   side of each path. Keep both noq crates on the same commit.
+- `src/ranking.rs` owns each connection's path priorities (`PathPriorities`:
+  configured base priority + demoted flag, effective noq priority
+  `2 * base + demoted` with ranking on, `base` otherwise) and the
+  `--path-ranking auto` ranker: a pure `Ranker` state machine (unit-tested
+  with synthetic counters) driven by a task that samples `Path::stats()` loss
+  (excluding PLPMTUD probes) per path and PINGs demoted paths. The client
+  enables it on the server with the `FRAME_PATH_RANKING` control frame. noq
+  has no path list API: path IDs are sequential and never reused, so the
+  ranker scans IDs above the highest seen. Do not rank on smoothed RTT (it
+  tracks the path's own queueing and flaps).
 
 ## Release Builds
 

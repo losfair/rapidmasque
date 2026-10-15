@@ -6,6 +6,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -19,6 +20,7 @@ use crate::ech_test::{ech_config_list_and_key_set, self_signed};
 use crate::endpoint::Endpoint as ProxyEndpoint;
 use crate::h3;
 use crate::quic::{self, TransportOptions, Verify, WIREGUARD_1280_DATAGRAM};
+use crate::ranking::{self, PathPriorities, RankingConfig};
 use crate::rules::RuleTable;
 use crate::server::{self, ServerState};
 use crate::tls::HandshakeData;
@@ -265,7 +267,7 @@ async fn path_priorities_apply_on_both_ends() {
     tokio::spawn(async move {
         let conn = server.accept().await.unwrap().await.unwrap();
         let _control = h3::open_control(&conn).await.unwrap();
-        tokio::spawn(h3::serve_uni_streams(conn.clone()));
+        tokio::spawn(h3::serve_uni_streams(conn.clone(), Default::default()));
         let _ = server_tx.send(conn.clone());
         conn.closed().await;
     });
@@ -287,7 +289,12 @@ async fn path_priorities_apply_on_both_ends() {
         "primary path must be pinned to the handshake's source address"
     );
     for spec in [primary, extra] {
-        tokio::spawn(client::maintain_path(conn.clone(), spec, control.clone()));
+        tokio::spawn(client::maintain_path(
+            conn.clone(),
+            spec,
+            control.clone(),
+            Default::default(),
+        ));
     }
 
     // Path 0 (primary) gets priority 1 and the extra path priority 3, on both
@@ -310,6 +317,159 @@ async fn path_priorities_apply_on_both_ends() {
         applied(&conn),
         applied(&server_conn)
     );
+}
+
+/// A UDP relay standing in for an impaired network path between one client
+/// and `upstream`: it drops `loss_permille`/1000 of the packets in each
+/// direction (evenly spread, so the rate is exact).
+async fn lossy_relay(upstream: SocketAddr, loss_permille: Arc<AtomicU32>) -> SocketAddr {
+    let sock = UdpSocket::bind("127.0.0.3:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        let mut client = None;
+        let mut debt = [0u32; 2];
+        while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+            let (to, dir) = if from == upstream {
+                match client {
+                    Some(c) => (c, 0),
+                    None => continue,
+                }
+            } else {
+                client = Some(from);
+                (upstream, 1)
+            };
+            debt[dir] += loss_permille.load(Ordering::Relaxed);
+            if debt[dir] >= 1000 {
+                debt[dir] -= 1000;
+                continue;
+            }
+            let _ = sock.send_to(&buf[..n], to).await;
+        }
+    });
+    addr
+}
+
+/// The local priority of the path to `remote`, if open.
+fn priority_towards(conn: &noq::Connection, remote: SocketAddr) -> Option<u8> {
+    (0..4 * quic::MAX_PATHS)
+        .filter_map(|id| conn.path(noq::PathId::from(id)))
+        .find(|p| p.remote_address().ok() == Some(remote))
+        .and_then(|p| p.priority().ok())
+}
+
+/// `--path-ranking auto`: a path whose loss is clearly worse than another path
+/// of the same priority is demoted on both ends (each end ranking what it
+/// sends), and promoted again once the loss stops.
+#[tokio::test(flavor = "multi_thread")]
+async fn lossy_path_is_demoted_and_recovers_on_both_ends() {
+    // Fast sampling; idle paths (only keepalives, 1/s) still yield samples.
+    let config = RankingConfig {
+        interval: Duration::from_millis(100),
+        min_sample_packets: 30,
+        max_sample_age: Duration::from_millis(500),
+        min_idle_sample_packets: 2,
+        sample_weight: 1.0,
+        demote_after: 2,
+        promote_after: 2,
+        min_change_interval: Duration::from_millis(500),
+        ..Default::default()
+    };
+    let fx = Fixture::new("ranking");
+    let server = fx.server(HOST);
+    let server_addr = server.local_addr().unwrap();
+    let (server_tx, server_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let priorities = Arc::new(PathPriorities::default());
+        ranking::start(conn.clone(), priorities.clone(), config);
+        let _control = h3::open_control(&conn).await.unwrap();
+        tokio::spawn(h3::serve_uni_streams(conn.clone(), priorities));
+        let _ = server_tx.send(conn.clone());
+        while let Ok(d) = conn.read_datagram().await {
+            let _ = conn.send_datagram(d);
+        }
+    });
+
+    // The handshake path (path 0, preferred by noq at equal priority, so it
+    // carries the traffic) goes through the relay; the extra path is direct.
+    let loss = Arc::new(AtomicU32::new(0));
+    let relay = lossy_relay(server_addr, loss.clone()).await;
+    let client = client_endpoint(true);
+    let conn = client
+        .connect_with(fx.client_config(false), relay, HOST)
+        .unwrap()
+        .await
+        .unwrap();
+    let server_conn = server_rx.await.unwrap();
+    let control = h3::open_control(&conn).await.unwrap();
+    let priorities = Arc::new(PathPriorities::default());
+    control.send_path_ranking().await.unwrap();
+    ranking::start(conn.clone(), priorities.clone(), config);
+    let direct: PathSpec = server_addr.to_string().parse().unwrap();
+    let primary = client::primary_path_spec(&conn, relay, std::slice::from_ref(&direct), 0).await;
+    for spec in [primary, direct] {
+        tokio::spawn(client::maintain_path(
+            conn.clone(),
+            spec,
+            control.clone(),
+            priorities.clone(),
+        ));
+    }
+    tokio::spawn({
+        let conn = conn.clone();
+        async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(2));
+            loop {
+                tick.tick().await;
+                if conn
+                    .send_datagram(bytes::Bytes::from_static(&[7; 1000]))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    });
+    tokio::spawn({
+        let conn = conn.clone();
+        async move { while conn.read_datagram().await.is_ok() {} }
+    });
+
+    // The server sees the relayed path as coming from the relay itself.
+    let relayed = |c: &noq::Connection| priority_towards(c, relay);
+    let wait_for = |want: u8| {
+        let (conn, server_conn) = (conn.clone(), server_conn.clone());
+        async move {
+            for _ in 0..300 {
+                if relayed(&conn) == Some(want) && relayed(&server_conn) == Some(want) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            panic!(
+                "relayed path priority: client {:?}, server {:?}, want {want}",
+                relayed(&conn),
+                relayed(&server_conn)
+            );
+        }
+    };
+
+    // Let the extra path come up and both paths collect clean samples.
+    wait_for(0).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(priority_towards(&conn, server_addr), Some(0));
+
+    loss.store(200, Ordering::Relaxed);
+    wait_for(1).await; // 2 * base 0 + demoted
+    assert_eq!(
+        priority_towards(&conn, server_addr),
+        Some(0),
+        "the clean path must stay preferred"
+    );
+
+    loss.store(0, Ordering::Relaxed);
+    wait_for(0).await;
 }
 
 async fn udp_echo() -> SocketAddr {
@@ -381,6 +541,7 @@ async fn tunnel_roundtrip_with_ech_and_multipath() {
                     .unwrap(),
             ],
             primary_priority: 0,
+            path_ranking: Default::default(),
             transport: transport(CongestionControl::None),
         },
         listen,

@@ -14,6 +14,7 @@ mod openbsd_arm64;
 mod qpack;
 mod qpack_tables;
 mod quic;
+mod ranking;
 mod reload;
 mod rules;
 mod server;
@@ -34,6 +35,7 @@ use crate::cli::{Cli, ClientArgs, Command, GenEchArgs, ServeArgs};
 use crate::ech::key::EchKeySet;
 use crate::endpoint::Endpoint as ProxyEndpoint;
 use crate::quic::Verify;
+use crate::ranking::PathRanking;
 use crate::reload::{ReloadPaths, spawn_reload};
 use crate::server::ServerState;
 
@@ -123,6 +125,12 @@ fn serve(args: ServeArgs) -> Result<()> {
 
 fn client(args: ClientArgs) -> Result<()> {
     let endpoint = ProxyEndpoint::parse(&args.endpoint)?;
+    if args.path_ranking == PathRanking::Auto {
+        let max = ranking::MAX_RANKED_PRIORITY;
+        if args.primary_priority > max || args.paths.iter().any(|p| p.priority > max) {
+            anyhow::bail!("--path-ranking auto needs path priorities of at most {max}");
+        }
+    }
 
     let verify = if args.insecure {
         Verify::Insecure
@@ -140,6 +148,7 @@ fn client(args: ClientArgs) -> Result<()> {
             ech_config_list: load_ech_config(&args)?,
             paths: args.paths.clone(),
             primary_priority: args.primary_priority,
+            path_ranking: args.path_ranking,
             transport: transport_options(args.congestion_control, args.path_spill_threshold_ms),
         },
         listen: args.listen,

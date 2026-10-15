@@ -8,9 +8,10 @@
 //! stream (capsules in DATA frames) is drained and ignored, matching
 //! zeromasque — UDP payloads ride QUIC DATAGRAMs (`crate::dgram`).
 //!
-//! One extension: the client announces its multipath path priorities on its
-//! control stream ([`FRAME_PATH_PRIORITY`]) so the proxy prefers the same
-//! paths for the return direction.
+//! Two extensions on the control stream: the client announces its multipath
+//! path priorities ([`FRAME_PATH_PRIORITY`]) so the proxy prefers the same
+//! paths for the return direction, and asks the proxy to rank paths by loss
+//! too ([`FRAME_PATH_RANKING`]).
 
 use std::sync::Arc;
 
@@ -20,6 +21,7 @@ use noq::{Connection, PathId, RecvStream, SendStream, VarInt};
 use tokio::sync::Mutex;
 
 use crate::qpack;
+use crate::ranking::{self, PathPriorities, RankingConfig};
 use crate::varint;
 
 pub const FRAME_DATA: u64 = 0x00;
@@ -32,6 +34,11 @@ const FRAME_SETTINGS: u64 = 0x04;
 /// unknown frame types (RFC 9114 §9), so other servers are unaffected. The type
 /// is "rmpp" in ASCII, outside the reserved (grease) range.
 pub const FRAME_PATH_PRIORITY: u64 = 0x726d_7070;
+/// rapidmasque extension frame on the control stream: rank the paths this
+/// peer sends on by their loss (`--path-ranking auto`, see `crate::ranking`).
+/// Payload: mode varint, 1 = auto. "rmpr" in ASCII.
+pub const FRAME_PATH_RANKING: u64 = 0x726d_7072;
+const PATH_RANKING_AUTO: u64 = 1;
 
 const STREAM_CONTROL: u64 = 0x00;
 const STREAM_PUSH: u64 = 0x01;
@@ -81,6 +88,18 @@ impl Control {
             .await
             .context("writing PATH_PRIORITY")
     }
+
+    /// Ask the peer to rank the paths it sends on by loss.
+    pub async fn send_path_ranking(&self) -> Result<()> {
+        let mut payload = Vec::new();
+        varint::encode(PATH_RANKING_AUTO, &mut payload);
+        self.0
+            .lock()
+            .await
+            .write_all(&frame(FRAME_PATH_RANKING, &payload))
+            .await
+            .context("writing PATH_RANKING")
+    }
 }
 
 /// Open our control stream and send SETTINGS.
@@ -108,13 +127,13 @@ pub async fn open_control(conn: &Connection) -> Result<Control> {
 /// Service the peer's unidirectional streams until the connection closes:
 /// read its control stream (logging SETTINGS, applying path priorities), drain
 /// QPACK streams, and refuse push and unknown stream types.
-pub async fn serve_uni_streams(conn: Connection) {
+pub async fn serve_uni_streams(conn: Connection, priorities: Arc<PathPriorities>) {
     while let Ok(recv) = conn.accept_uni().await {
-        tokio::spawn(serve_uni_stream(conn.clone(), recv));
+        tokio::spawn(serve_uni_stream(conn.clone(), priorities.clone(), recv));
     }
 }
 
-async fn serve_uni_stream(conn: Connection, recv: RecvStream) {
+async fn serve_uni_stream(conn: Connection, priorities: Arc<PathPriorities>, recv: RecvStream) {
     let mut reader = FrameReader::new(recv);
     let ty = match reader.read_varint().await {
         Ok(Some(ty)) => ty,
@@ -137,7 +156,17 @@ async fn serve_uni_stream(conn: Connection, recv: RecvStream) {
             loop {
                 match reader.read_frame(MAX_HEADER_FRAME).await {
                     Ok(Some((FRAME_PATH_PRIORITY, payload))) => {
-                        apply_path_priority(&conn, &payload)
+                        apply_path_priority(&conn, &priorities, &payload)
+                    }
+                    Ok(Some((FRAME_PATH_RANKING, payload))) => {
+                        if varint::decode(&payload).map(|(mode, _)| mode) == Some(PATH_RANKING_AUTO)
+                        {
+                            ranking::start(
+                                conn.clone(),
+                                priorities.clone(),
+                                RankingConfig::default(),
+                            );
+                        }
                     }
                     Ok(Some(_)) => {}
                     Ok(None) => break,
@@ -169,17 +198,19 @@ fn parse_path_priority(payload: &[u8]) -> Option<(PathId, u8)> {
     ))
 }
 
-fn apply_path_priority(conn: &Connection, payload: &[u8]) {
+fn apply_path_priority(conn: &Connection, priorities: &PathPriorities, payload: &[u8]) {
     let Some((path_id, priority)) = parse_path_priority(payload) else {
         log::debug!("ignoring malformed PATH_PRIORITY frame");
         return;
     };
     // The peer announces a path once it is established, so it exists here
     // unless it was abandoned meanwhile.
-    match conn.path(path_id).map(|path| path.set_priority(priority)) {
-        Some(Ok(_)) => log::debug!("path {path_id}: peer set priority {priority}"),
-        _ => log::debug!("path {path_id}: priority {priority} for a closed path ignored"),
+    if conn.path(path_id).is_none() {
+        log::debug!("path {path_id}: priority {priority} for a closed path ignored");
+        return;
     }
+    log::debug!("path {path_id}: peer set priority {priority}");
+    priorities.set_base(conn, path_id, priority);
 }
 
 fn parse_settings(mut payload: &[u8]) -> Option<Vec<(u64, u64)>> {

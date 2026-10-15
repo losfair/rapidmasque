@@ -255,6 +255,35 @@ hold-back off. Each side's flag governs what it sends. Paths with equal
 priority always share traffic, and `/backup` paths still only carry traffic
 when no non-backup path is usable.
 
+#### Automatic path ranking
+
+`--path-ranking auto` (client) ranks paths by measured loss, for paths whose
+quality varies (e.g. two cellular uplinks). Within each group of paths with the
+same configured priority, a path whose loss is clearly worse than the group's
+best is **demoted**: it falls behind the rest of its group (but never behind a
+path with a worse configured priority), so traffic moves to the better paths.
+It is **promoted** again once its loss recovers.
+
+- Loss is sampled from what each end *sends*, so the client ranks the upload
+  direction and asks the proxy (a rapidmasque extension frame on the HTTP/3
+  control stream) to rank the download direction on its own measurements.
+- A path is demoted when its loss is at least 5% and 3 points above the best
+  path of its group, in 3 consecutive samples (a sample is ~40 packets, or the
+  packets sent within 30 s on a quiet path), and in the smoothed loss rate.
+  The best path of a group is never demoted, so paths that are all equally
+  lossy keep sharing traffic. The 5% floor stays clear of the ~2% loss BBRv3
+  causes itself while probing for bandwidth.
+- A demoted path is PINGed every 100 ms (about 400 bytes/s) so its loss keeps
+  being measured; it is promoted after 3 samples at no more than half those
+  levels, typically within 15-30 s of the loss stopping. A path changes rank
+  at most every 10 s.
+- RTT is not used: smoothed RTT includes the queueing delay of whatever
+  traffic a path carries, so ranking on it would chase traffic back and forth.
+- Path priorities must be at most 127 with ranking on (a demoted path's noq
+  priority is `2 * priority + 1`).
+
+Rank changes are logged on each end.
+
 With extra paths configured, the client binds a dual-stack `[::]:0` socket so
 IPv4 and IPv6 paths can share the connection. If the proxy does not negotiate
 multipath (e.g. masque-go), extra paths are skipped with a warning and the
@@ -383,6 +412,8 @@ multipath case (two extra paths via 127.0.0.2 / 127.0.0.3).
   and per flow.
 - `src/client.rs` - the local UDP→CONNECT-UDP proxy client and multipath path
   maintenance.
+- `src/ranking.rs` - per-connection path priorities and automatic path
+  ranking by loss (`--path-ranking auto`).
 - `src/rules.rs` - the JSON endpoint→target rule table.
 - `src/quic.rs` - noq transport config (multipath, idle/keepalive) + BoringSSL
   context setup, ECH install hooks.

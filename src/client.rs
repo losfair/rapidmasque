@@ -25,6 +25,7 @@ use crate::dgram;
 use crate::endpoint::Endpoint as ProxyEndpoint;
 use crate::h3::{self, FrameReader};
 use crate::quic::{self, CAPSULE_PROTOCOL_TRUE, TransportOptions, Verify, send_datagram};
+use crate::ranking::{self, PathPriorities, PathRanking, RankingConfig};
 use crate::tls::HandshakeData;
 use crate::util::{CHANNEL_CAP, RECV_BUF, hex};
 
@@ -125,6 +126,8 @@ pub struct ConnectParams {
     pub paths: Vec<PathSpec>,
     /// Scheduling priority of the primary path (only used with `paths`).
     pub primary_priority: u8,
+    /// Rank paths by measured loss, on both ends (only used with `paths`).
+    pub path_ranking: PathRanking,
     pub transport: TransportOptions,
 }
 
@@ -294,21 +297,34 @@ async fn run_session(
             return false;
         }
     };
-    tokio::spawn(h3::serve_uni_streams(conn.clone()));
+    let priorities = Arc::new(PathPriorities::default());
+    tokio::spawn(h3::serve_uni_streams(conn.clone(), priorities.clone()));
     tokio::spawn(quic::log_path_events(conn.clone()));
+    if !p.paths.is_empty() && p.path_ranking == PathRanking::Auto && conn.is_multipath_enabled() {
+        // Rank what we send, and ask the proxy to rank what it sends.
+        if let Err(e) = control.send_path_ranking().await {
+            log::warn!("requesting path ranking from the proxy failed: {e:#}");
+        }
+        ranking::start(conn.clone(), priorities.clone(), RankingConfig::default());
+    }
     if !p.paths.is_empty() {
         // Also keep the primary path: if it is abandoned (e.g. its uplink went
         // away) while extra paths carry the tunnel, re-open it once it works.
         tokio::spawn({
-            let (conn, control) = (conn.clone(), control.clone());
+            let (conn, control, priorities) = (conn.clone(), control.clone(), priorities.clone());
             let (paths, priority) = (p.paths.clone(), p.primary_priority);
             async move {
                 let primary = primary_path_spec(&conn, proxy_addr, &paths, priority).await;
-                maintain_path(conn, primary, control).await
+                maintain_path(conn, primary, control, priorities).await
             }
         });
         for spec in p.paths.iter().cloned() {
-            tokio::spawn(maintain_path(conn.clone(), spec, control.clone()));
+            tokio::spawn(maintain_path(
+                conn.clone(),
+                spec,
+                control.clone(),
+                priorities.clone(),
+            ));
         }
     }
     log::info!(
@@ -541,7 +557,12 @@ pub(crate) async fn primary_path_spec(
 /// re-opening it whenever it fails or is abandoned. Each time the path comes
 /// up (a re-opened path gets a new ID), its priority is set locally and sent
 /// to the proxy, which applies it to its side of the path.
-pub(crate) async fn maintain_path(conn: Connection, spec: PathSpec, control: h3::Control) {
+pub(crate) async fn maintain_path(
+    conn: Connection,
+    spec: PathSpec,
+    control: h3::Control,
+    priorities: Arc<PathPriorities>,
+) {
     if !conn.is_multipath_enabled() {
         log::warn!("proxy did not negotiate QUIC multipath; not opening path {spec}");
         return;
@@ -564,9 +585,7 @@ pub(crate) async fn maintain_path(conn: Connection, spec: PathSpec, control: h3:
                 if up != Some(path.id()) {
                     log::info!("multipath path {spec} up (path id {})", path.id());
                     up = Some(path.id());
-                    if let Err(e) = path.set_priority(spec.priority) {
-                        log::debug!("multipath path {spec}: setting priority: {e}");
-                    }
+                    priorities.set_base(&conn, path.id(), spec.priority);
                     if let Err(e) = control.send_path_priority(path.id(), spec.priority).await {
                         log::debug!("multipath path {spec}: announcing priority: {e:#}");
                     }
