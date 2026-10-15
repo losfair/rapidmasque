@@ -84,6 +84,12 @@ and documented in `README.md`.
   (`.github/scripts/smoke-test.sh`) exercises a real `rtable=0` path. OpenBSD
   has no dual-stack sockets: `quic::client_bind_socket` falls back to the
   primary's family there.
+- Outgoing datagram queue management (`--datagram-queue-*`, default on)
+  is noq's `TransportConfig::datagram_send_codel` (CoDel plus a hard
+  `max_delay`, in the losfair/noq fork): the queue that builds up is noq's
+  send buffer, so drops must happen there, where the queueing time is known.
+  Shared transport flags live in `cli::TransportArgs` (flattened into `serve`
+  and `client`), which builds `quic::TransportOptions`.
 - `src/stats.rs` is the optional `--stats-listen` endpoint: a minimal
   hand-written HTTP/1.1 responder (no HTTP crate) serving `GET /stats` JSON
   from a `Registry` of live connections (server and client register each

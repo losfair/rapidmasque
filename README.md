@@ -182,6 +182,31 @@ HTTP/3 control and request-stream traffic is not rate-limited either; it stays
 reliable, since loss detection and retransmission keep running. ACKs, RTT
 estimation and MTU discovery are unaffected.
 
+#### Datagram queue management
+
+Tunnelled datagrams that arrive faster than the paths carry wait in the QUIC
+connection's send buffer. Without management, a tunnelled TCP flow (e.g.
+CUBIC inside WireGuard) keeps speeding up until it sees loss, and the only
+loss would be the 4 MiB buffer overflowing: a standing queue of ~1.7 s at
+20 Mbit/s that every other tunnelled flow, interactive ones included, waits
+behind. So each side manages its queue (on `serve` and `client`):
+
+- **CoDel** (RFC 8289): once datagrams keep waiting longer than
+  `--datagram-queue-target-ms` (default 5) for a whole
+  `--datagram-queue-interval-ms` (default 100), the oldest are dropped at an
+  increasing rate until the delay is back under the target. Bursts pass, and
+  tunnelled TCP sees loss promptly and settles at a low queueing delay.
+- **A hard limit**, `--datagram-queue-max-ms` (default 200): datagrams older
+  than this are always dropped. CoDel sheds traffic that does not slow down
+  on loss (e.g. constant-rate UDP above the path's rate) too slowly; without
+  the limit it would still queue up to the buffer size.
+
+`--datagram-queue-target-ms 0` turns queue management off, and
+`--datagram-queue-max-ms 0` removes the hard limit. For tunnelled flows with
+long round trips, an interval closer to their RTT lets larger bursts drain.
+The stats endpoint counts drops per connection (`datagrams_dropped_delay`,
+and `datagrams_dropped_overflow` for a full buffer).
+
 ### QUIC multipath
 
 Both ends negotiate the QUIC multipath extension (up to 8 concurrent paths per

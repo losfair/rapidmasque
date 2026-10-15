@@ -1,16 +1,21 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use anyhow::{Result, bail};
+use clap::{Args, Parser, Subcommand};
 
 use crate::cc::CongestionControl;
 use crate::client::PathSpec;
-use crate::quic::DEFAULT_PATH_SPILL_THRESHOLD;
+use crate::quic::{
+    DEFAULT_BBR3_INITIAL_WINDOW, DEFAULT_DATAGRAM_QUEUE_INTERVAL, DEFAULT_DATAGRAM_QUEUE_MAX,
+    DEFAULT_DATAGRAM_QUEUE_TARGET, DEFAULT_PATH_SPILL_THRESHOLD, TransportOptions,
+};
+use crate::ranking::PathRanking;
 
 /// Smallest `--bbr3-initial-window`: two QUIC minimum-size (1200-byte)
 /// packets.
 const MIN_BBR3_INITIAL_WINDOW: u64 = 2 * 1200;
-use crate::ranking::PathRanking;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Multipath MASQUE (CONNECT-UDP) proxy and client", long_about = None)]
@@ -55,31 +60,8 @@ pub struct ServeArgs {
     #[arg(long, value_name = "PATH")]
     pub ech_key: Option<PathBuf>,
 
-    /// Congestion control for what this side sends (proxy -> client).
-    /// `bbr3` (default) runs BBRv3 per path; `none` never holds datagrams
-    /// back, leaving rate control to the tunnelled protocol (e.g. TCP inside
-    /// WireGuard) to avoid double congestion control.
-    #[arg(long, value_enum, default_value_t = CongestionControl::Bbr3)]
-    pub congestion_control: CongestionControl,
-
-    /// BBRv3 initial congestion window in bytes, for every path this side
-    /// sends on [default: 65536, ~48 full-size packets; noq's own is 12000].
-    /// A larger window lets a new path ramp up faster on a high
-    /// bandwidth-delay path (BBRv3 paces it out rather than bursting), at
-    /// the cost of overshooting slow low-RTT links at path start. At least
-    /// 2400. Only with `--congestion-control bbr3`.
-    #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(MIN_BBR3_INITIAL_WINDOW..))]
-    pub bbr3_initial_window: Option<u64>,
-
-    /// Queueing delay (milliseconds) accepted on a preferred path before
-    /// traffic spills onto less preferred ones (paths with a higher
-    /// `/priority=N`). While the preferred path can send everything queued
-    /// within this time at its current BBRv3 rate, lower-priority paths carry
-    /// no data. `0` spills whenever the preferred path is momentarily paced,
-    /// which spreads even light traffic over all paths. Has no effect while
-    /// all paths share one priority.
-    #[arg(long, value_name = "MS", default_value_t = DEFAULT_PATH_SPILL_THRESHOLD.as_millis() as u64)]
-    pub path_spill_threshold_ms: u64,
+    #[command(flatten)]
+    pub transport: TransportArgs,
 
     /// Serve a JSON stats snapshot (connections, multipath paths, priorities,
     /// ranking, RTT, loss, traffic) over plain HTTP at `http://ADDR/stats`.
@@ -163,10 +145,25 @@ pub struct ClientArgs {
     #[arg(long, value_name = "FILE", conflicts_with = "ech_config")]
     pub ech_config_file: Option<PathBuf>,
 
-    /// Congestion control for what this side sends (client -> proxy).
-    /// `bbr3` (default) runs BBRv3 per path; `none` never holds datagrams
-    /// back, leaving rate control to the tunnelled protocol (e.g. TCP inside
-    /// WireGuard) to avoid double congestion control.
+    #[command(flatten)]
+    pub transport: TransportArgs,
+
+    /// Serve a JSON stats snapshot (connections, multipath paths, priorities,
+    /// ranking, RTT, loss, traffic) over plain HTTP at `http://ADDR/stats`.
+    /// Off by default. No TLS or authentication and it reveals peer
+    /// addresses: bind it to loopback or a management network.
+    #[arg(long, value_name = "IP:PORT")]
+    pub stats_listen: Option<SocketAddr>,
+}
+
+/// QUIC transport settings for what this side sends, shared by `serve` and
+/// `client`.
+#[derive(Args, Debug)]
+pub struct TransportArgs {
+    /// Congestion control for what this side sends. `bbr3` (default) runs
+    /// BBRv3 per path; `none` never holds datagrams back, leaving rate control
+    /// to the tunnelled protocol (e.g. TCP inside WireGuard) to avoid double
+    /// congestion control.
     #[arg(long, value_enum, default_value_t = CongestionControl::Bbr3)]
     pub congestion_control: CongestionControl,
 
@@ -189,12 +186,53 @@ pub struct ClientArgs {
     #[arg(long, value_name = "MS", default_value_t = DEFAULT_PATH_SPILL_THRESHOLD.as_millis() as u64)]
     pub path_spill_threshold_ms: u64,
 
-    /// Serve a JSON stats snapshot (connections, multipath paths, priorities,
-    /// ranking, RTT, loss, traffic) over plain HTTP at `http://ADDR/stats`.
-    /// Off by default. No TLS or authentication and it reveals peer
-    /// addresses: bind it to loopback or a management network.
-    #[arg(long, value_name = "IP:PORT")]
-    pub stats_listen: Option<SocketAddr>,
+    /// Target queueing delay (milliseconds) for tunnelled datagrams waiting
+    /// to be sent (CoDel, RFC 8289). When they keep waiting longer than this
+    /// for a whole `--datagram-queue-interval-ms`, the oldest are dropped at
+    /// an increasing rate, so a tunnelled TCP flow that outpaces the paths
+    /// sees loss promptly instead of filling a multi-second queue that every
+    /// other flow then waits behind. `0` disables it: datagrams are then only
+    /// dropped when the 4 MiB send buffer is full.
+    #[arg(long, value_name = "MS", default_value_t = DEFAULT_DATAGRAM_QUEUE_TARGET.as_millis() as u64)]
+    pub datagram_queue_target_ms: u64,
+
+    /// How long (milliseconds) the queueing delay may stay above
+    /// `--datagram-queue-target-ms` before dropping starts. On the order of
+    /// the tunnelled flows' round-trip time; raise it for long paths so
+    /// bursts have time to drain.
+    #[arg(long, value_name = "MS", default_value_t = DEFAULT_DATAGRAM_QUEUE_INTERVAL.as_millis() as u64, value_parser = clap::value_parser!(u64).range(1..))]
+    pub datagram_queue_interval_ms: u64,
+
+    /// Hard limit (milliseconds) on how long a tunnelled datagram may wait to
+    /// be sent; older ones are always dropped. Catches traffic that does not
+    /// slow down on loss (e.g. constant-rate UDP above the path's rate), which
+    /// CoDel alone sheds too slowly. `0` removes the limit.
+    #[arg(long, value_name = "MS", default_value_t = DEFAULT_DATAGRAM_QUEUE_MAX.as_millis() as u64)]
+    pub datagram_queue_max_ms: u64,
+}
+
+impl TransportArgs {
+    /// The transport options these flags select.
+    pub fn options(&self) -> Result<TransportOptions> {
+        if self.bbr3_initial_window.is_some() && self.congestion_control != CongestionControl::Bbr3
+        {
+            bail!("--bbr3-initial-window needs --congestion-control bbr3");
+        }
+        Ok(TransportOptions {
+            congestion_control: self.congestion_control,
+            bbr3_initial_window: self
+                .bbr3_initial_window
+                .unwrap_or(DEFAULT_BBR3_INITIAL_WINDOW),
+            path_spill_threshold: (self.path_spill_threshold_ms > 0)
+                .then(|| Duration::from_millis(self.path_spill_threshold_ms)),
+            datagram_codel: (self.datagram_queue_target_ms > 0).then(|| noq::DatagramCodel {
+                target: Duration::from_millis(self.datagram_queue_target_ms),
+                interval: Duration::from_millis(self.datagram_queue_interval_ms),
+                max_delay: (self.datagram_queue_max_ms > 0)
+                    .then(|| Duration::from_millis(self.datagram_queue_max_ms)),
+            }),
+        })
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -225,12 +263,24 @@ mod tests {
             panic!("expected the client subcommand");
         };
         assert_eq!(args.path_ranking, PathRanking::Auto);
-        assert_eq!(args.congestion_control, CongestionControl::Bbr3);
-        assert_eq!(args.path_spill_threshold_ms, 10);
         assert_eq!(args.rtable, None);
-        assert_eq!(args.bbr3_initial_window, None);
-        let parse = |window: &str| {
-            Cli::try_parse_from([
+        let options = args.transport.options().unwrap();
+        assert_eq!(options.congestion_control, CongestionControl::Bbr3);
+        assert_eq!(options.bbr3_initial_window, DEFAULT_BBR3_INITIAL_WINDOW);
+        assert_eq!(
+            options.path_spill_threshold,
+            Some(Duration::from_millis(10))
+        );
+        assert_eq!(
+            options.datagram_codel,
+            Some(noq::DatagramCodel {
+                target: Duration::from_millis(5),
+                interval: Duration::from_millis(100),
+                max_delay: Some(Duration::from_millis(200)),
+            })
+        );
+        let parse = |flags: &[&str]| {
+            let mut argv = vec![
                 "rapidmasque",
                 "serve",
                 "--rules",
@@ -239,15 +289,39 @@ mod tests {
                 "c.pem",
                 "--key",
                 "k.pem",
-                "--bbr3-initial-window",
-                window,
-            ])
+            ];
+            argv.extend_from_slice(flags);
+            Cli::try_parse_from(argv).map(|cli| match cli.command {
+                Command::Serve(args) => args,
+                _ => panic!("expected the serve subcommand"),
+            })
         };
-        let Command::Serve(args) = parse("65536").unwrap().command else {
-            panic!("expected the serve subcommand");
-        };
-        assert_eq!(args.bbr3_initial_window, Some(65536));
-        assert!(parse("1200").is_err());
+        let args = parse(&["--bbr3-initial-window", "65536"]).unwrap();
+        assert_eq!(args.transport.options().unwrap().bbr3_initial_window, 65536);
         assert_eq!(args.stats_listen, None);
+        assert!(parse(&["--bbr3-initial-window", "1200"]).is_err());
+        assert!(
+            parse(&[
+                "--bbr3-initial-window",
+                "65536",
+                "--congestion-control",
+                "none"
+            ])
+            .unwrap()
+            .transport
+            .options()
+            .is_err()
+        );
+        let args = parse(&[
+            "--datagram-queue-target-ms",
+            "0",
+            "--path-spill-threshold-ms",
+            "0",
+        ])
+        .unwrap();
+        let options = args.transport.options().unwrap();
+        assert_eq!(options.datagram_codel, None);
+        assert_eq!(options.path_spill_threshold, None);
+        assert!(parse(&["--datagram-queue-interval-ms", "0"]).is_err());
     }
 }

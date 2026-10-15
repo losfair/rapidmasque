@@ -596,6 +596,135 @@ async fn bbr3_initial_window_applies_to_connections() {
     assert!(cwnd >= WINDOW, "cwnd {cwnd} below the configured {WINDOW}");
 }
 
+/// A UDP relay for one client in front of `upstream` whose client-to-upstream
+/// direction is a bottleneck: a token bucket of `rate` bytes per second (and a
+/// 32 KiB burst) that drops what exceeds it, like a policer.
+async fn policed_relay(upstream: SocketAddr, rate: f64) -> SocketAddr {
+    const BURST: f64 = 32.0 * 1024.0;
+    let sock = UdpSocket::bind("127.0.0.3:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        let mut client = None;
+        let mut tokens = BURST;
+        let mut last = tokio::time::Instant::now();
+        while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+            let to = if from == upstream {
+                match client {
+                    Some(c) => c,
+                    None => continue,
+                }
+            } else {
+                client = Some(from);
+                let now = tokio::time::Instant::now();
+                tokens = (tokens + rate * (now - last).as_secs_f64()).min(BURST);
+                last = now;
+                if tokens < n as f64 {
+                    continue;
+                }
+                tokens -= n as f64;
+                upstream
+            };
+            let _ = sock.send_to(&buf[..n], to).await;
+        }
+    });
+    addr
+}
+
+/// Offer 4 MB/s of echoed datagrams through a 2 MB/s bottleneck for 3 s and
+/// return the median round-trip time of the echoes received in the last
+/// second, plus the client's datagram drop counters.
+async fn overloaded_tunnel_rtt(codel: Option<noq::DatagramCodel>) -> (Duration, u64, u64) {
+    let fx = Fixture::new(if codel.is_some() { "codel" } else { "nocodel" });
+    let server = fx.server(HOST);
+    let server_addr = server.local_addr().unwrap();
+    tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        while let Ok(d) = conn.read_datagram().await {
+            let _ = conn.send_datagram(d);
+        }
+    });
+    let relay = policed_relay(server_addr, 2_000_000.0).await;
+    let config = quic::build_client_config(
+        &Verify::Roots {
+            ca_file: Some(fx.cert.clone()),
+        },
+        None,
+        TransportOptions {
+            datagram_codel: codel,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let client = client_endpoint(false);
+    let conn = client
+        .connect_with(config, relay, HOST)
+        .unwrap()
+        .await
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    let sender = tokio::spawn({
+        let conn = conn.clone();
+        async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(1));
+            while start.elapsed() < Duration::from_secs(3) {
+                tick.tick().await;
+                for _ in 0..4 {
+                    let mut payload = vec![0u8; 1000];
+                    let sent = start.elapsed().as_nanos() as u64;
+                    payload[..8].copy_from_slice(&sent.to_be_bytes());
+                    let _ = conn.send_datagram(payload.into());
+                }
+            }
+        }
+    });
+    let mut rtts = Vec::new();
+    while start.elapsed() < Duration::from_secs(3) {
+        let Ok(Ok(d)) =
+            tokio::time::timeout(Duration::from_millis(100), conn.read_datagram()).await
+        else {
+            continue;
+        };
+        let sent = Duration::from_nanos(u64::from_be_bytes(d[..8].try_into().unwrap()));
+        let received = start.elapsed();
+        if received >= Duration::from_secs(2) {
+            rtts.push(received - sent);
+        }
+    }
+    sender.abort();
+    let stats = conn.stats();
+    rtts.sort();
+    let median = rtts.get(rtts.len() / 2).copied().unwrap_or(Duration::MAX);
+    (
+        median,
+        stats.datagrams_dropped_delay,
+        stats.datagrams_dropped_overflow,
+    )
+}
+
+/// With queue management (the default), tunnelled datagrams that outpace the
+/// path are dropped instead of queueing for seconds in front of everything
+/// else. The offered load here does not slow down on loss, so it is the
+/// 200 ms hard limit, not CoDel's gradual drops, that bounds the delay.
+#[tokio::test(flavor = "multi_thread")]
+async fn datagram_queue_delay_stays_low_under_overload() {
+    let (unmanaged, delay_drops, _) = overloaded_tunnel_rtt(None).await;
+    assert_eq!(delay_drops, 0);
+    let (managed, delay_drops, _) =
+        overloaded_tunnel_rtt(TransportOptions::default().datagram_codel).await;
+    eprintln!("median RTT under overload: {unmanaged:?} unmanaged, {managed:?} managed");
+    assert!(delay_drops > 0, "CoDel never dropped");
+    assert!(
+        unmanaged > Duration::from_millis(500),
+        "without CoDel the queue should have grown, median RTT {unmanaged:?}"
+    );
+    assert!(
+        managed < Duration::from_millis(300),
+        "median RTT {managed:?} with CoDel (without: {unmanaged:?})"
+    );
+}
+
 async fn udp_echo() -> SocketAddr {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = sock.local_addr().unwrap();
