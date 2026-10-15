@@ -32,10 +32,10 @@ tokio-stream = "0.1"
 # Pinned to the losfair/noq fork for per-path scheduling priority, the path
 # spill threshold and datagram queue management (not in upstream noq). Keep
 # both crates on the same commit.
-noq = { git = "https://github.com/losfair/noq", rev = "baad794ebd604b4b4f1c0ff71664a66af652c10d", default-features = false, features = ["runtime-tokio", "ring", "bloom", "tracing-log"] }
+noq = { git = "https://github.com/losfair/noq", rev = "ac785a68744f799056e791e5e1378eab7cfd1f7d", default-features = false, features = ["runtime-tokio", "ring", "bloom", "tracing-log"] }
 # Direct dep only for `coding::Encodable` (to read a `PathId` for the multipath
 # AEAD nonce); same commit as noq's own.
-noq-proto = { git = "https://github.com/losfair/noq", rev = "baad794ebd604b4b4f1c0ff71664a66af652c10d", default-features = false, features = ["ring", "bloom", "tracing-log"] }
+noq-proto = { git = "https://github.com/losfair/noq", rev = "ac785a68744f799056e791e5e1378eab7cfd1f7d", default-features = false, features = ["ring", "bloom", "tracing-log"] }
 # BoringSSL: the TLS 1.3 handshake (via its QUIC API), ECH, and packet
 # protection (AEAD + header protection). boring 4 keeps the ECH code identical
 # to zeromasque's.

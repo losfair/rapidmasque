@@ -563,7 +563,7 @@ dependencies = [
 [[package]]
 name = "noq"
 version = "1.3.0"
-source = "git+https://github.com/losfair/noq?rev=baad794ebd604b4b4f1c0ff71664a66af652c10d#baad794ebd604b4b4f1c0ff71664a66af652c10d"
+source = "git+https://github.com/losfair/noq?rev=ac785a68744f799056e791e5e1378eab7cfd1f7d#ac785a68744f799056e791e5e1378eab7cfd1f7d"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -583,7 +583,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.3.0"
-source = "git+https://github.com/losfair/noq?rev=baad794ebd604b4b4f1c0ff71664a66af652c10d#baad794ebd604b4b4f1c0ff71664a66af652c10d"
+source = "git+https://github.com/losfair/noq?rev=ac785a68744f799056e791e5e1378eab7cfd1f7d#ac785a68744f799056e791e5e1378eab7cfd1f7d"
 dependencies = [
  "bytes",
  "derive_more",
@@ -609,7 +609,7 @@ dependencies = [
 [[package]]
 name = "noq-udp"
 version = "1.3.0"
-source = "git+https://github.com/losfair/noq?rev=baad794ebd604b4b4f1c0ff71664a66af652c10d#baad794ebd604b4b4f1c0ff71664a66af652c10d"
+source = "git+https://github.com/losfair/noq?rev=ac785a68744f799056e791e5e1378eab7cfd1f7d#ac785a68744f799056e791e5e1378eab7cfd1f7d"
 dependencies = [
  "cfg_aliases",
  "libc",
