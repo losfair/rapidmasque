@@ -259,8 +259,9 @@ when no non-backup path is usable.
 
 #### Automatic path ranking
 
-`--path-ranking auto` (client) ranks paths by measured loss, for paths whose
-quality varies (e.g. two cellular uplinks). Within each group of paths with the
+The client ranks paths by measured loss by default (`--path-ranking auto`;
+`--path-ranking off` keeps the configured priorities as they are), for paths
+whose quality varies (e.g. two cellular uplinks). Within each group of paths with the
 same configured priority, a path whose loss is clearly worse than the group's
 best is **demoted**: it falls behind the rest of its group (but never behind a
 path with a worse configured priority), so traffic moves to the better paths.
@@ -281,8 +282,9 @@ It is **promoted** again once its loss recovers.
   at most every 10 s.
 - RTT is not used: smoothed RTT includes the queueing delay of whatever
   traffic a path carries, so ranking on it would chase traffic back and forth.
-- Path priorities must be at most 127 with ranking on (a demoted path's noq
-  priority is `2 * priority + 1`).
+- With ranking on (the default), path priorities must be at most 127 (a
+  demoted path's noq priority is `2 * priority + 1`); use
+  `--path-ranking off` for higher ones.
 
 Rank changes are logged on each end.
 
@@ -472,7 +474,7 @@ multipath case (two extra paths via 127.0.0.2 / 127.0.0.3).
 - `src/client.rs` - the local UDP→CONNECT-UDP proxy client and multipath path
   maintenance.
 - `src/ranking.rs` - per-connection path priorities and automatic path
-  ranking by loss (`--path-ranking auto`).
+  ranking by loss (`--path-ranking`, on by default).
 - `src/routed_socket.rs` - the client's multi-socket noq socket for per-path
   OpenBSD routing tables (`/rtable=N`).
 - `src/rules.rs` - the JSON endpoint→target rule table.

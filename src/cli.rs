@@ -122,14 +122,15 @@ pub struct ClientArgs {
     #[arg(long, value_name = "N")]
     pub rtable: Option<u32>,
 
-    /// Rank paths by measured loss: `auto` demotes a path whose loss is
-    /// clearly worse than the best path with the same priority (at least 5%,
-    /// and 3 points above the best, for 3 samples in a row), so traffic moves
-    /// to the better paths of that priority; it is promoted again once its
-    /// loss recovers. The proxy does the same for what it sends. Paths never
-    /// move across configured priorities, which must then be at most 127.
+    /// Rank paths by measured loss: `auto` (default) demotes a path whose
+    /// loss is clearly worse than the best path with the same priority (at
+    /// least 5%, and 3 points above the best, for 3 samples in a row), so
+    /// traffic moves to the better paths of that priority; it is promoted
+    /// again once its loss recovers. The proxy does the same for what it
+    /// sends. Paths never move across configured priorities, which must then
+    /// be at most 127. `off` keeps the configured priorities as they are.
     /// Only meaningful with `--path`.
-    #[arg(long, value_enum, default_value_t = PathRanking::Off)]
+    #[arg(long, value_enum, default_value_t = PathRanking::Auto)]
     pub path_ranking: PathRanking,
 
     /// Skip TLS certificate verification (testing only).
@@ -181,4 +182,30 @@ pub struct GenEchArgs {
     /// fallback; on ECH acceptance only the inner SNI is authenticated.
     #[arg(long, value_name = "NAME")]
     pub public_name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_defaults() {
+        let cli = Cli::try_parse_from([
+            "rapidmasque",
+            "client",
+            "--endpoint",
+            "https://proxy.example/connect",
+            "--listen",
+            "127.0.0.1:5353",
+        ])
+        .unwrap();
+        let Command::Client(args) = cli.command else {
+            panic!("expected the client subcommand");
+        };
+        assert_eq!(args.path_ranking, PathRanking::Auto);
+        assert_eq!(args.congestion_control, CongestionControl::Bbr3);
+        assert_eq!(args.path_spill_threshold_ms, 10);
+        assert_eq!(args.rtable, None);
+        assert_eq!(args.stats_listen, None);
+    }
 }

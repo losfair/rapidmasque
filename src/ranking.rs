@@ -5,7 +5,7 @@
 //! server over the HTTP/3 control stream), plus whether automatic ranking has
 //! demoted it. The effective noq priority is derived from both.
 //!
-//! With `--path-ranking auto`, each end runs a [`Ranker`] over the paths it
+//! With `--path-ranking auto` (the default), each end runs a [`Ranker`] over the paths it
 //! sends on: it samples each path's loss rate from noq's path statistics and
 //! demotes a path whose loss is clearly worse than the best path with the same
 //! base priority, so traffic moves to the better paths of that group. The
@@ -32,11 +32,11 @@ use crate::quic::PathScan;
 /// Whether to rank paths automatically by measured loss.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum PathRanking {
-    /// Paths keep their configured priority (default).
-    #[default]
+    /// Paths keep their configured priority.
     Off,
     /// Demote paths with clearly worse loss than the best path of the same
-    /// priority, on both ends.
+    /// priority, on both ends (default).
+    #[default]
     Auto,
 }
 

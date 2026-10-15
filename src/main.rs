@@ -142,7 +142,10 @@ fn client(args: ClientArgs) -> Result<()> {
     if args.path_ranking == PathRanking::Auto {
         let max = ranking::MAX_RANKED_PRIORITY;
         if args.primary_priority > max || args.paths.iter().any(|p| p.priority > max) {
-            anyhow::bail!("--path-ranking auto needs path priorities of at most {max}");
+            anyhow::bail!(
+                "path priorities above {max} need --path-ranking off (automatic ranking, the \
+                 default, uses the rest of the range)"
+            );
         }
     }
 

@@ -704,7 +704,7 @@ async fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
 }
 
 /// The stats endpoint lists the tunnel's connection on both ends, with its
-/// paths and their priorities.
+/// paths, their priorities and the (default) automatic ranking.
 #[tokio::test(flavor = "multi_thread")]
 async fn stats_endpoint_reports_connections_and_paths() {
     let fx = Fixture::new("stats");
@@ -746,12 +746,15 @@ async fn stats_endpoint_reports_connections_and_paths() {
             let paths = conn["paths"].as_array().unwrap();
             conn["flows"] == 1
                 && conn["multipath"] == true
+                // Ranking is on by default (the client asks the proxy too), so
+                // the effective noq priority is 2 * configured priority.
+                && conn["path_ranking"] == true
                 && paths
                     .iter()
                     .any(|p| p["priority"] == 0 && p["status"] == "available")
                 && paths
                     .iter()
-                    .any(|p| p["priority"] == 2 && p["base_priority"] == 2 && p["rtt_ms"].is_f64())
+                    .any(|p| p["priority"] == 4 && p["base_priority"] == 2 && p["rtt_ms"].is_f64())
         });
         if done {
             assert_eq!(last[0]["connections"][0]["info"]["sni"], HOST);
