@@ -50,6 +50,23 @@ diagnose() {
         kdump -f "$work/ktrace.out" | tail -n 60
     fi
     echo "--- udp sockets"; netstat -an -f inet -p udp || true
+    echo "--- plain UDP over loopback (to the echo target)"
+    "$tools/udpsend" 127.0.0.1:5390 probe 2>&1 || true
+    echo "--- interfaces"; netstat -in || true
+    echo "--- IP counters"; netstat -s -p ip | grep -i -E 'drop|fail|no route|discard|output|fragment' || true
+    echo "--- capture processes"; ps -ax -o pid,stat,command | grep '[t]cpdump' || true
+    echo "--- pf"; cat /etc/pf.conf 2>&1 || true
+    sudo -n pfctl -si 2>&1 || true
+    sudo -n pfctl -sr 2>&1 || true
+    echo "states: $(sudo -n pfctl -ss 2>/dev/null | wc -l)"
+    sudo -n pfctl -ss 2>&1 | grep -E '4433|5390' | head -n 40 || true
+    echo "--- after disabling pf"
+    sudo -n pfctl -d 2>&1 || true
+    "$tools/udpsend" 127.0.0.1:5390 probe 2>&1 || true
+    if [ -n "${port:-}" ]; then
+        sleep 5
+        "$tools/udpsend" "127.0.0.1:$port" probe 2>&1 || true
+    fi
 }
 
 # show_logs CLIENT_LOG: the server's and a client's log, plus whatever the
@@ -142,7 +159,7 @@ if [ "$(uname -s)" = OpenBSD ]; then
     done
     netstat -s -p udp > "$work/udpstat.before" 2>&1 || true
     spec="$egress_ip:4433/rtable=0"
-    for round in 1 2 3; do
+    for round in 1 2 3 4; do
         # The same extra path without a routing table first, to tell
         # multipath problems from routing-table ones.
         check "multipath-$round" 6005 --path "$egress_ip:4433"
@@ -159,6 +176,7 @@ if [ "$(uname -s)" = OpenBSD ]; then
             i=$((i + 1))
             if [ $i -gt 15 ]; then
                 echo "FAIL: path $spec did not come up and receive (round $round)"
+                port=6003
                 ktrace -t c -f "$work/server.ktrace" -p "$server_pid" || true
                 diagnose "$cpid" 7003
                 ktrace -C || true
