@@ -29,10 +29,12 @@ tokio-stream = "0.1"
 # BoringSSL in through noq's `crypto` traits (`src/tls/`), so ECH termination and
 # the SNI guard work exactly as in zeromasque. `ring` only backs the endpoint's
 # stateless-reset HMAC and the (unused) retry-token key.
-noq = { version = "1.3", default-features = false, features = ["runtime-tokio", "ring", "bloom", "tracing-log"] }
+# Pinned to the losfair/noq fork for per-path scheduling priority and the path
+# spill threshold (not in upstream noq). Keep both crates on the same commit.
+noq = { git = "https://github.com/losfair/noq", rev = "26ab75fd23b2ad09a3ef26373820afda8e3cc1d1", default-features = false, features = ["runtime-tokio", "ring", "bloom", "tracing-log"] }
 # Direct dep only for `coding::Encodable` (to read a `PathId` for the multipath
-# AEAD nonce); same version as noq's own.
-noq-proto = { version = "1.3", default-features = false, features = ["ring", "bloom", "tracing-log"] }
+# AEAD nonce); same commit as noq's own.
+noq-proto = { git = "https://github.com/losfair/noq", rev = "26ab75fd23b2ad09a3ef26373820afda8e3cc1d1", default-features = false, features = ["ring", "bloom", "tracing-log"] }
 # BoringSSL: the TLS 1.3 handshake (via its QUIC API), ECH, and packet
 # protection (AEAD + header protection). boring 4 keeps the ECH code identical
 # to zeromasque's.
