@@ -137,18 +137,17 @@ jobs:
 
   build-openbsd:
     name: build (${{ matrix.label }})
-    # Same-architecture runners, so the VM never emulates a foreign CPU.
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 180
+    # cross-platform-actions ships an x86-64-only QEMU, so both VMs run on
+    # x86-64 runners: amd64 is KVM-accelerated, arm64 is fully emulated (slow).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
         include:
           - label: x86_64-unknown-openbsd
-            runner: ubuntu-24.04
             architecture: x86-64
           - label: aarch64-unknown-openbsd
-            runner: ubuntu-24.04-arm
             architecture: arm64
     steps:
       - uses: actions/checkout@v4
