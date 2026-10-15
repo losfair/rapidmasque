@@ -33,7 +33,8 @@ pids="$pids $!"
     --cert "$work/cert.pem" --key "$work/key.pem" --ech-key "$work/ech.pem" \
     --stats-listen 127.0.0.1:9100 \
     > "$work/server.log" 2>&1 &
-pids="$pids $!"
+server_pid=$!
+pids="$pids $server_pid"
 sleep 2
 
 # diagnose PID STATS_PORT: what a stuck client is doing (OpenBSD only).
@@ -41,9 +42,7 @@ diagnose() {
     [ "$(uname -s)" = OpenBSD ] || return 0
     echo "--- client process"; ps -o pid,pcpu,state,wchan,command -p "$1" || true
     echo "--- client stats"; ftp -V -o - "http://127.0.0.1:$2/stats" 2>&1 || true
-    for port in 9100 9101; do
-        echo "--- server stats ($port)"; ftp -V -o - "http://127.0.0.1:$port/stats" 2>&1 || true
-    done
+    echo "--- server stats"; ftp -V -o - "http://127.0.0.1:9100/stats" 2>&1 || true
     echo "--- client syscalls (2 s)"
     if ktrace -f "$work/ktrace.out" -t cn -p "$1"; then
         sleep 2
@@ -53,17 +52,22 @@ diagnose() {
     echo "--- udp sockets"; netstat -an -f inet -p udp || true
 }
 
-# show_logs CLIENT_LOG: the server's and a client's log; trace logs without
-# their span enter/exit noise.
+# show_logs CLIENT_LOG: the server's and a client's log, plus whatever the
+# routing-table check captured.
 show_logs() {
-    for log in "$work/server.log" "$work/server-trace.log" "$1"; do
-        [ -f "$log" ] || continue
-        echo "--- $(basename "$log")"
-        grep -v -e '^\[TRACE\] \(->\|<-\|--\) ' -e '^\[TRACE\] nothing' "$log" | tail -n 1500
-    done
+    echo "--- server log"; cat "$work/server.log"
+    echo "--- client log"; cat "$1"
     for cap in "$work"/tcpdump-*.txt; do
         [ -f "$cap" ] || continue
-        echo "--- $(basename "$cap")"; tail -n 200 "$cap"
+        echo "--- $(basename "$cap")"; tail -n 100 "$cap"
+    done
+    for kt in "$work"/*.ktrace; do
+        [ -f "$kt" ] || continue
+        echo "--- $(basename "$kt"): socket syscalls, failures, last calls"
+        kdump -f "$kt" > "$kt.txt" 2>/dev/null || true
+        grep -E 'CALL +(sendmsg|recvmsg|sendto|recvfrom)' "$kt.txt" | awk '{print $4}' | sed 's/(.*//' | sort | uniq -c
+        grep -E -A1 'CALL +(sendmsg|recvmsg)' "$kt.txt" | grep -E 'RET +(sendmsg|recvmsg) -1' | sort | uniq -c
+        grep -E 'sendmsg|recvmsg' "$kt.txt" | tail -n 40
     done
     if [ -f "$work/udpstat.before" ]; then
         echo "--- UDP counters, before and now"
@@ -72,14 +76,22 @@ show_logs() {
     fi
 }
 
+# path_rx STATS_PORT REMOTE: datagrams received on the client's path to REMOTE.
+path_rx() {
+    ftp -V -o - "http://127.0.0.1:$1/stats" 2>/dev/null | awk -v r="\"remote\": \"$2\"" '
+        index($0, r) { f = 1 }
+        f && /"udp_rx"/ { g = 1 }
+        g && /"datagrams"/ { gsub(/[^0-9]/, ""); print; exit }'
+}
+
 # check NAME PORT [CLIENT_ARGS...]: tunnel one datagram through a fresh client.
 check() {
     name="$1"
     port="$2"
     shift 2
     stats=$((port + 1000))
-    RUST_LOG="${CLIENT_LOG:-info}" "$bin" client --listen "127.0.0.1:$port" \
-        --endpoint https://localhost:4433/connect --proxy-addr "127.0.0.1:${proxy_port:-4433}" \
+    "$bin" client --listen "127.0.0.1:$port" \
+        --endpoint https://localhost:4433/connect --proxy-addr 127.0.0.1:4433 \
         --stats-listen "127.0.0.1:$stats" \
         --insecure "$@" > "$work/client-$name.log" 2>&1 &
     cpid=$!
@@ -127,45 +139,42 @@ if [ "$(uname -s)" = OpenBSD ]; then
     # The same extra path without a routing table first, to tell multipath
     # problems from routing-table ones.
     check multipath 6005 --path "$egress_ip:4433"
-    # Diagnostics: a second server with noq's trace log, client trace logs,
-    # packet captures and UDP counters, all shown if a check fails.
-    RUST_LOG=trace "$bin" serve --addr 0.0.0.0:4434 --rules "$work/rules.json" \
-        --cert "$work/cert.pem" --key "$work/key.pem" \
-        --stats-listen 127.0.0.1:9101 > "$work/server-trace.log" 2>&1 &
-    pids="$pids $!"
+    # Diagnostics for this check, shown if it fails: syscall traces of the
+    # server and the client, packet captures and the UDP counters.
+    ktrace -t c -f "$work/server.ktrace" -p "$server_pid" || true
     egress_if="$(ifconfig egress | sed -n '1s/:.*//p')"
     for ifc in lo0 "$egress_if"; do
-        sudo tcpdump -n -l -i "$ifc" udp port 4434 > "$work/tcpdump-$ifc.txt" 2>&1 &
-        pids="$pids $!"
+        sudo tcpdump -n -l -i "$ifc" udp port 4433 > "$work/tcpdump-$ifc.txt" 2>&1 &
     done
     netstat -s -p udp > "$work/udpstat.before" 2>&1 || true
-    sleep 2
-    proxy_port=4434
-    export CLIENT_LOG=trace
-    spec="$egress_ip:4434/rtable=0"
-    RUST_LOG=trace "$bin" client --listen 127.0.0.1:6003 \
-        --endpoint https://localhost:4433/connect --proxy-addr 127.0.0.1:4434 \
+    sleep 1
+    spec="$egress_ip:4433/rtable=0"
+    ktrace -t c -f "$work/client.ktrace" "$bin" client --listen 127.0.0.1:6003 \
+        --endpoint https://localhost:4433/connect --proxy-addr 127.0.0.1:4433 \
         --stats-listen 127.0.0.1:7003 \
         --insecure --path "$spec" > "$work/client-rtable-up.log" 2>&1 &
     cpid=$!
     pids="$pids $cpid"
+    # The path must come up and receive through its own socket.
     i=0
-    until grep -q "multipath path $spec up" "$work/client-rtable-up.log"; do
+    until grep -q "multipath path $spec up" "$work/client-rtable-up.log" &&
+        [ "$(path_rx 7003 "$egress_ip:4433")" -gt 0 ] 2>/dev/null; do
         i=$((i + 1))
-        if [ $i -gt 10 ]; then
-            echo "FAIL: path $spec did not come up"
+        if [ $i -gt 15 ]; then
+            echo "FAIL: path $spec did not come up and receive"
             diagnose "$cpid" 7003
             show_logs "$work/client-rtable-up.log"
             exit 1
         fi
         sleep 1
     done
+    ktrace -C || true
     grep -q "routing table 0: socket" "$work/client-rtable-up.log" || {
         echo "FAIL: no routing-table socket"
         cat "$work/client-rtable-up.log"
         exit 1
     }
+    echo "PASS: path in routing table 0 up and receiving"
     kill "$cpid" 2>/dev/null || true
     check rtable 6004 --path "$spec"
-    echo "PASS: path in routing table 0 up"
 fi
