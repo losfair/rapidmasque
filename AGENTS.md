@@ -74,6 +74,11 @@ and documented in `README.md`.
   has no path list API: path IDs are sequential and never reused, so the
   ranker scans IDs above the highest seen. Do not rank on smoothed RTT (it
   tracks the path's own queueing and flaps).
+- `src/stats.rs` is the optional `--stats-listen` endpoint: a minimal
+  hand-written HTTP/1.1 responder (no HTTP crate) serving `GET /stats` JSON
+  from a `Registry` of live connections (server and client register each
+  connection with its `PathPriorities`). Path lists come from
+  `quic::PathScan`, refreshed every second per registered connection.
 
 ## Release Builds
 

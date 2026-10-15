@@ -27,8 +27,7 @@ use std::time::{Duration, Instant};
 
 use noq::{Connection, PathId};
 
-use crate::quic::MAX_PATHS;
-use crate::util::path_id_u32;
+use crate::quic::PathScan;
 
 /// Whether to rank paths automatically by measured loss.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -134,6 +133,16 @@ impl PathPriorities {
         self.update(conn, path_id, |e| e.base = base);
     }
 
+    /// Whether automatic ranking runs on this connection.
+    pub fn ranking(&self) -> bool {
+        self.inner.lock().unwrap().ranking
+    }
+
+    /// A snapshot of every path's entry.
+    pub fn snapshot(&self) -> HashMap<PathId, PathEntry> {
+        self.inner.lock().unwrap().paths.clone()
+    }
+
     fn base(&self, path_id: PathId) -> u8 {
         let table = self.inner.lock().unwrap();
         table.paths.get(&path_id).map_or(0, |e| e.base)
@@ -201,9 +210,7 @@ async fn run(conn: Connection, priorities: Arc<PathPriorities>, config: RankingC
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut probe = tokio::time::interval(config.probe_interval);
     probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Path IDs are assigned in order and never reused, so live paths are the
-    // known ones plus possibly a few new ones above the highest seen.
-    let mut next_id = 0u32;
+    let mut scan = PathScan::default();
     while conn.close_reason().is_none() {
         tokio::select! {
             _ = tick.tick() => {}
@@ -217,25 +224,19 @@ async fn run(conn: Connection, priorities: Arc<PathPriorities>, config: RankingC
             }
             _ = conn.closed() => return,
         }
-        let mut observations = Vec::new();
-        let known: Vec<u32> = ranker.paths.keys().map(|id| path_id_u32(*id)).collect();
-        for id in known.into_iter().chain(next_id..next_id + 2 * MAX_PATHS) {
-            let path_id = PathId::from(id);
-            if observations.iter().any(|o: &Observation| o.id == path_id) {
-                continue;
-            }
-            let Some(path) = conn.path(path_id) else {
-                continue;
-            };
-            next_id = next_id.max(id + 1);
-            let stats = path.stats();
-            observations.push(Observation {
-                id: path_id,
-                base: priorities.base(path_id),
-                sent: stats.sent_packets.saturating_sub(stats.sent_plpmtud_probes),
-                lost: stats.lost_packets.saturating_sub(stats.lost_plpmtud_probes),
-            });
-        }
+        let observations: Vec<Observation> = scan
+            .scan(&conn)
+            .into_iter()
+            .map(|path| {
+                let stats = path.stats();
+                Observation {
+                    id: path.id(),
+                    base: priorities.base(path.id()),
+                    sent: stats.sent_packets.saturating_sub(stats.sent_plpmtud_probes),
+                    lost: stats.lost_packets.saturating_sub(stats.lost_plpmtud_probes),
+                }
+            })
+            .collect();
         let gone: Vec<PathId> = ranker
             .paths
             .keys()

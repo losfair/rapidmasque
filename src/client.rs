@@ -13,6 +13,7 @@ use std::fmt;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -26,6 +27,7 @@ use crate::endpoint::Endpoint as ProxyEndpoint;
 use crate::h3::{self, FrameReader};
 use crate::quic::{self, CAPSULE_PROTOCOL_TRUE, TransportOptions, Verify, send_datagram};
 use crate::ranking::{self, PathPriorities, PathRanking, RankingConfig};
+use crate::stats;
 use crate::tls::HandshakeData;
 use crate::util::{CHANNEL_CAP, RECV_BUF, hex};
 
@@ -128,6 +130,8 @@ pub struct ConnectParams {
     pub primary_priority: u8,
     /// Rank paths by measured loss, on both ends (only used with `paths`).
     pub path_ranking: PathRanking,
+    /// Connections listed on the stats endpoint, if enabled.
+    pub stats: Option<Arc<stats::Registry>>,
     pub transport: TransportOptions,
 }
 
@@ -338,8 +342,23 @@ async fn run_session(
     let mut by_addr: HashMap<SocketAddr, FlowState> = HashMap::new();
     let mut flows: HashMap<u64, SocketAddr> = HashMap::new();
     let mut next_token = 0u64;
+    let flow_count = Arc::new(AtomicUsize::new(0));
+    let _stats = p.stats.as_ref().map(|registry| {
+        let flow_count = flow_count.clone();
+        registry.register(
+            &conn,
+            priorities.clone(),
+            serde_json::json!({
+                "endpoint": p.endpoint.authority,
+                "proxy_addr": proxy_addr.to_string(),
+                "ech": ech,
+            }),
+            move || flow_count.load(Ordering::Relaxed),
+        )
+    });
 
     let reason = loop {
+        flow_count.store(by_addr.len(), Ordering::Relaxed);
         tokio::select! {
             local = lrx.recv() => {
                 let Some(first) = local else { break "local socket closed".to_string() };

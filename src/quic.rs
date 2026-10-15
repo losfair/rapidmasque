@@ -452,6 +452,40 @@ pub(crate) async fn log_path_events(conn: noq::Connection) {
     }
 }
 
+/// Finds a connection's live multipath paths. noq has no path list API, but
+/// path IDs are assigned in order and never reused, so the live paths are the
+/// ones found before plus possibly a few above the highest seen. Scan often
+/// enough (about once a second) that fewer than `2 * MAX_PATHS` paths open in
+/// between.
+#[derive(Debug, Default)]
+pub(crate) struct PathScan {
+    known: std::collections::BTreeSet<u32>,
+    next_id: u32,
+}
+
+impl PathScan {
+    /// The paths that are currently open (or abandoned but not yet discarded),
+    /// in path ID order.
+    pub(crate) fn scan(&mut self, conn: &noq::Connection) -> Vec<noq::Path> {
+        let candidates: std::collections::BTreeSet<u32> = self
+            .known
+            .iter()
+            .copied()
+            .chain(self.next_id..self.next_id + 2 * MAX_PATHS)
+            .collect();
+        let mut paths = Vec::new();
+        self.known.clear();
+        for id in candidates {
+            if let Some(path) = conn.path(noq::PathId::from(id)) {
+                self.known.insert(id);
+                self.next_id = self.next_id.max(id + 1);
+                paths.push(path);
+            }
+        }
+        paths
+    }
+}
+
 /// Queue an HTTP datagram on the connection. Returns `false` once the
 /// connection is gone. Oversize datagrams are dropped with a warning: QUIC
 /// DATAGRAMs cannot be fragmented.

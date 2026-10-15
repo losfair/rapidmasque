@@ -18,6 +18,7 @@ mod ranking;
 mod reload;
 mod rules;
 mod server;
+mod stats;
 mod tls;
 mod util;
 mod varint;
@@ -95,8 +96,10 @@ fn serve(args: ServeArgs) -> Result<()> {
         rule_table.allowed_sni_hosts(),
         transport,
     )?;
+    let stats_registry = args.stats_listen.map(|_| stats::Registry::new("server"));
     let state = Arc::new(ServerState {
         rules: ArcSwap::from_pointee(rule_table),
+        stats: stats_registry.clone(),
     });
     let reload_paths = ReloadPaths {
         cert: args.cert.clone(),
@@ -107,6 +110,7 @@ fn serve(args: ServeArgs) -> Result<()> {
     };
 
     runtime().block_on(async move {
+        start_stats(args.stats_listen, stats_registry).await?;
         let socket = quic::bind_endpoint_socket(args.addr)
             .with_context(|| format!("binding QUIC listener {}", args.addr))?;
         let endpoint = Endpoint::new(
@@ -149,12 +153,29 @@ fn client(args: ClientArgs) -> Result<()> {
             paths: args.paths.clone(),
             primary_priority: args.primary_priority,
             path_ranking: args.path_ranking,
+            stats: args.stats_listen.map(|_| stats::Registry::new("client")),
             transport: transport_options(args.congestion_control, args.path_spill_threshold_ms),
         },
         listen: args.listen,
     };
 
-    runtime().block_on(client::run_proxy(opts))
+    runtime().block_on(async move {
+        start_stats(args.stats_listen, opts.conn.stats.clone()).await?;
+        client::run_proxy(opts).await
+    })
+}
+
+/// Bind and serve the stats endpoint, if enabled.
+async fn start_stats(
+    addr: Option<std::net::SocketAddr>,
+    registry: Option<Arc<stats::Registry>>,
+) -> Result<()> {
+    if let (Some(addr), Some(registry)) = (addr, registry) {
+        let listener = stats::bind(addr).await?;
+        eprintln!("stats endpoint on http://{addr}/stats");
+        tokio::spawn(stats::serve(listener, registry));
+    }
+    Ok(())
 }
 
 fn transport_options(

@@ -67,6 +67,13 @@ pub struct ServeArgs {
     /// all paths share one priority.
     #[arg(long, value_name = "MS", default_value_t = DEFAULT_PATH_SPILL_THRESHOLD.as_millis() as u64)]
     pub path_spill_threshold_ms: u64,
+
+    /// Serve a JSON stats snapshot (connections, multipath paths, priorities,
+    /// ranking, RTT, loss, traffic) over plain HTTP at `http://ADDR/stats`.
+    /// Off by default. No TLS or authentication and it reveals peer
+    /// addresses: bind it to loopback or a management network.
+    #[arg(long, value_name = "IP:PORT")]
+    pub stats_listen: Option<SocketAddr>,
 }
 
 #[derive(Parser, Debug)]
@@ -150,6 +157,13 @@ pub struct ClientArgs {
     /// all paths share one priority.
     #[arg(long, value_name = "MS", default_value_t = DEFAULT_PATH_SPILL_THRESHOLD.as_millis() as u64)]
     pub path_spill_threshold_ms: u64,
+
+    /// Serve a JSON stats snapshot (connections, multipath paths, priorities,
+    /// ranking, RTT, loss, traffic) over plain HTTP at `http://ADDR/stats`.
+    /// Off by default. No TLS or authentication and it reveals peer
+    /// addresses: bind it to loopback or a management network.
+    #[arg(long, value_name = "IP:PORT")]
+    pub stats_listen: Option<SocketAddr>,
 }
 
 #[derive(Parser, Debug)]

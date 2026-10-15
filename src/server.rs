@@ -25,6 +25,7 @@ use crate::h3::{self, FrameReader};
 use crate::quic::{self, CAPSULE_PROTOCOL_TRUE};
 use crate::ranking::PathPriorities;
 use crate::rules::RuleTable;
+use crate::stats;
 use crate::tls::HandshakeData;
 use crate::util::{CHANNEL_CAP, RECV_BUF};
 
@@ -37,6 +38,8 @@ const FLOW_IDLE_ERROR: u32 = 0x100; // H3_NO_ERROR
 /// they handshook with.
 pub struct ServerState {
     pub rules: ArcSwap<RuleTable>,
+    /// Connections listed on the stats endpoint, if enabled.
+    pub stats: Option<Arc<stats::Registry>>,
 }
 
 /// Client→target side of one active flow, as seen by the datagram dispatcher.
@@ -107,6 +110,19 @@ async fn handle_connection(incoming: Incoming, state: Arc<ServerState>) -> Resul
 
     let flows: FlowMap = Arc::new(Mutex::new(HashMap::new()));
     tokio::spawn(dispatch_datagrams(conn.clone(), flows.clone()));
+    let _stats = state.stats.as_ref().map(|registry| {
+        let flows = flows.clone();
+        registry.register(
+            &conn,
+            priorities.clone(),
+            serde_json::json!({
+                "client_addr": from.to_string(),
+                "sni": hs.as_ref().and_then(|h| h.server_name.clone()),
+                "ech": hs.as_ref().is_some_and(|h| h.ech_accepted),
+            }),
+            move || flows.lock().unwrap().len(),
+        )
+    });
 
     // The client's external (handshake path) address — the preserved source
     // for transparent rules.

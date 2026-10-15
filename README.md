@@ -289,6 +289,41 @@ IPv4 and IPv6 paths can share the connection. If the proxy does not negotiate
 multipath (e.g. masque-go), extra paths are skipped with a warning and the
 tunnel runs single-path.
 
+### Stats endpoint
+
+`--stats-listen IP:PORT` (on `serve` and `client`, off by default) serves a
+JSON snapshot at `http://IP:PORT/stats`:
+
+```
+$ curl -s http://127.0.0.1:9100/stats
+{
+  "role": "client", "version": "0.1.0", "uptime_secs": 3600,
+  "connections": [{
+    "id": 140507909560848, "uptime_secs": 3590, "multipath": true,
+    "path_ranking": true, "flows": 3,
+    "info": { "endpoint": "proxy.example:4433", "proxy_addr": "203.0.113.7:4433", "ech": true },
+    "sent_packets": 1043211, "lost_packets": 2210,
+    "udp_tx": { "datagrams": 1040022, "bytes": 1380412218 }, "udp_rx": { ... },
+    "paths": [{
+      "id": 0, "remote": "203.0.113.7:4433", "local_ip": "192.168.1.20",
+      "status": "available", "priority": 0, "base_priority": 0,
+      "demoted": false, "ranked_loss": 0.001,
+      "rtt_ms": 23.4, "cwnd": 412000, "mtu": 1452,
+      "sent_packets": 900211, "lost_packets": 900, "sent_bytes": ..., "lost_bytes": ...,
+      "congestion_events": 12, "udp_tx": { ... }, "udp_rx": { ... }
+    }, ...]
+  }]
+}
+```
+
+Each live QUIC connection lists its multipath paths (open, or abandoned but
+not yet discarded) with their effective noq `priority`, the configured
+`base_priority`, the automatic ranking state (`demoted`, and `ranked_loss`, the
+smoothed loss rate of what this end sends, once sampled) and noq's per-path
+counters. On the server, `info` carries the client's handshake address, SNI
+and ECH status. The endpoint is plain HTTP without authentication and
+reveals peer addresses: bind it to loopback or a management network.
+
 ### Hot reload
 
 Send `SIGHUP` to rebuild the TLS/ECH configuration *and* the rule table from
@@ -415,6 +450,7 @@ multipath case (two extra paths via 127.0.0.2 / 127.0.0.3).
 - `src/ranking.rs` - per-connection path priorities and automatic path
   ranking by loss (`--path-ranking auto`).
 - `src/rules.rs` - the JSON endpoint→target rule table.
+- `src/stats.rs` - the optional HTTP stats endpoint (`--stats-listen`).
 - `src/quic.rs` - noq transport config (multipath, idle/keepalive) + BoringSSL
   context setup, ECH install hooks.
 - `src/cc.rs` - congestion control choice: BBRv3 (default) or the no-op

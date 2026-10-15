@@ -23,6 +23,7 @@ use crate::quic::{self, TransportOptions, Verify, WIREGUARD_1280_DATAGRAM};
 use crate::ranking::{self, PathPriorities, RankingConfig};
 use crate::rules::RuleTable;
 use crate::server::{self, ServerState};
+use crate::stats;
 use crate::tls::HandshakeData;
 
 /// The certificate from `ech_test::self_signed` covers this name.
@@ -486,9 +487,21 @@ async fn udp_echo() -> SocketAddr {
     addr
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn tunnel_roundtrip_with_ech_and_multipath() {
-    let fx = Fixture::new("tunnel");
+/// A running server + local client proxy, tunnelling to a UDP echo target.
+struct Tunnel {
+    /// The client's local UDP listen address.
+    listen: SocketAddr,
+}
+
+/// Start a server (rule-pinned to a UDP echo target) and a client proxy with
+/// ECH and the extra paths `paths(proxy_addr)`, optionally listing their
+/// connections in stats registries.
+async fn start_tunnel(
+    fx: &Fixture,
+    paths: impl FnOnce(SocketAddr) -> Vec<PathSpec>,
+    server_stats: Option<Arc<stats::Registry>>,
+    client_stats: Option<Arc<stats::Registry>>,
+) -> Tunnel {
     let target = udp_echo().await;
 
     // Server: bind first to learn the port the rule's authority must carry.
@@ -518,10 +531,10 @@ async fn tunnel_roundtrip_with_ech_and_multipath() {
     .unwrap();
     let state = Arc::new(ServerState {
         rules: ArcSwap::from_pointee(rules),
+        stats: server_stats,
     });
     tokio::spawn(server::run(endpoint, state));
 
-    // Client: a local UDP proxy with ECH and an extra multipath path.
     let listen = {
         let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         s.local_addr().unwrap()
@@ -535,37 +548,129 @@ async fn tunnel_roundtrip_with_ech_and_multipath() {
                 ca_file: Some(fx.cert.clone()),
             },
             ech_config_list: Some(fx.ech_list.clone()),
-            paths: vec![
-                format!("{proxy_addr}@127.0.0.2")
-                    .parse::<PathSpec>()
-                    .unwrap(),
-            ],
+            paths: paths(proxy_addr),
             primary_priority: 0,
             path_ranking: Default::default(),
+            stats: client_stats,
             transport: transport(CongestionControl::None),
         },
         listen,
     };
     tokio::spawn(client::run_proxy(opts));
+    Tunnel { listen }
+}
 
-    let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let mut buf = vec![0u8; 2048];
-    for attempt in 0..50 {
-        app.send_to(format!("hello {attempt}").as_bytes(), listen)
-            .await
-            .unwrap();
-        if let Ok(Ok(n)) =
-            tokio::time::timeout(Duration::from_millis(200), app.recv(&mut buf)).await
-        {
-            let reply = std::str::from_utf8(&buf[..n]).unwrap();
-            assert!(
-                reply.starts_with("echo:hello "),
-                "unexpected reply {reply:?}"
-            );
+impl Tunnel {
+    /// Send datagrams through the tunnel until one is echoed back.
+    async fn roundtrip(&self) {
+        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        for attempt in 0..50 {
+            app.send_to(format!("hello {attempt}").as_bytes(), self.listen)
+                .await
+                .unwrap();
+            if let Ok(Ok(n)) =
+                tokio::time::timeout(Duration::from_millis(200), app.recv(&mut buf)).await
+            {
+                let reply = std::str::from_utf8(&buf[..n]).unwrap();
+                assert!(
+                    reply.starts_with("echo:hello "),
+                    "unexpected reply {reply:?}"
+                );
+                return;
+            }
+        }
+        panic!("no reply through the tunnel");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tunnel_roundtrip_with_ech_and_multipath() {
+    let fx = Fixture::new("tunnel");
+    // An extra multipath path from another loopback source address.
+    let tunnel = start_tunnel(
+        &fx,
+        |proxy| vec![format!("{proxy}@127.0.0.2").parse().unwrap()],
+        None,
+        None,
+    )
+    .await;
+    tunnel.roundtrip().await;
+}
+
+/// `GET` `path` from an HTTP server; returns the status code and body.
+async fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    sock.write_all(format!("GET {path} HTTP/1.1\r\nHost: stats\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut response = String::new();
+    sock.read_to_string(&mut response).await.unwrap();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+    (status, body.to_string())
+}
+
+/// The stats endpoint lists the tunnel's connection on both ends, with its
+/// paths and their priorities.
+#[tokio::test(flavor = "multi_thread")]
+async fn stats_endpoint_reports_connections_and_paths() {
+    let fx = Fixture::new("stats");
+    let (server_stats, client_stats) = (
+        stats::Registry::new("server"),
+        stats::Registry::new("client"),
+    );
+    let mut endpoints = Vec::new();
+    for registry in [&server_stats, &client_stats] {
+        let listener = stats::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        endpoints.push(listener.local_addr().unwrap());
+        tokio::spawn(stats::serve(listener, registry.clone()));
+    }
+    let tunnel = start_tunnel(
+        &fx,
+        |proxy| vec![format!("{proxy}@127.0.0.2/priority=2").parse().unwrap()],
+        Some(server_stats),
+        Some(client_stats),
+    )
+    .await;
+    tunnel.roundtrip().await;
+
+    // Both ends report one connection with the primary path and the extra
+    // path at priority 2 (announced to the server), and one flow.
+    let mut last = Vec::new();
+    for _ in 0..50 {
+        last.clear();
+        for (addr, role) in endpoints.iter().zip(["server", "client"]) {
+            let (status, body) = http_get(*addr, "/stats").await;
+            assert_eq!(status, 200);
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["role"], role);
+            last.push(v);
+        }
+        let done = last.iter().all(|v| {
+            let Some([conn]) = v["connections"].as_array().map(Vec::as_slice) else {
+                return false;
+            };
+            let paths = conn["paths"].as_array().unwrap();
+            conn["flows"] == 1
+                && conn["multipath"] == true
+                && paths
+                    .iter()
+                    .any(|p| p["priority"] == 0 && p["status"] == "available")
+                && paths
+                    .iter()
+                    .any(|p| p["priority"] == 2 && p["base_priority"] == 2 && p["rtt_ms"].is_f64())
+        });
+        if done {
+            assert_eq!(last[0]["connections"][0]["info"]["sni"], HOST);
+            assert_eq!(last[0]["connections"][0]["info"]["ech"], true);
+            assert_eq!(http_get(endpoints[0], "/nope").await.0, 404);
             return;
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("no reply through the tunnel");
+    panic!("unexpected stats: {last:#?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
