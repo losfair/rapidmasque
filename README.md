@@ -55,8 +55,9 @@ The Linux binaries are fully static and run on any distribution; they are built
 natively inside Alpine (`.github/scripts/build-musl.sh`). The OpenBSD 7.9
 binaries are cross-built on Linux (`.github/scripts/cross-openbsd.sh`: nightly
 Rust with `-Zbuild-std`, the official OpenBSD sysroot sets, clang/lld) and then
-smoke-tested in OpenBSD VMs (`.github/scripts/smoke-test.sh`). `SHA256SUMS`
-covers all archives.
+smoke-tested in OpenBSD VMs (`.github/scripts/smoke-test.sh`); releases wait for
+the amd64 test, while the much slower emulated arm64 test runs on every push but
+does not gate a release. `SHA256SUMS` covers all archives.
 
 To cross-build OpenBSD locally (needs clang >= 22, cmake, Go, rustup):
 

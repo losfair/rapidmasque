@@ -64,7 +64,8 @@ and documented in `README.md`.
   (`.github/scripts/build-musl.sh`); rustup's musl toolchain links build
   scripts statically and breaks bindgen.
 - OpenBSD: cross-built from Linux (`.github/scripts/cross-openbsd.sh`), then
-  run in OpenBSD VMs (`smoke-test.sh`). Gotchas it encodes: tier-3 target
+  run in OpenBSD VMs (`smoke-test.sh`; only amd64 gates releases, the emulated
+  arm64 VM is too slow). Gotchas it encodes: tier-3 target
   (nightly `-Zbuild-std`, pinned in CI); unversioned `.so` symlinks in the
   sysroot; `-z nobtcfi` via rust-lld; clang >= 22 (older LLVM crashes on
   aarch64-openbsd stack-protector code); a forced `<pthread.h>` include for

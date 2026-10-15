@@ -136,9 +136,9 @@ jobs:
           path: dist/*
 
   # OpenBSD is cross-built on Linux (`.github/scripts/cross-openbsd.sh`):
-  # nightly -Zbuild-std + the official OpenBSD sysroot + clang/lld. A VM per
-  # arch then runs the result (test-openbsd); compiling inside an emulated
-  # arm64 VM would take hours.
+  # nightly -Zbuild-std + the official OpenBSD sysroot + clang/lld. VMs then
+  # run the result (test-openbsd*); compiling inside an emulated arm64 VM
+  # would take hours.
   build-openbsd:
     name: build (${{ matrix.label }})
     runs-on: ubuntu-24.04
@@ -208,35 +208,56 @@ jobs:
           name: smoke-${{ matrix.label }}
           path: out/
 
+  # Run the cross-built binaries on OpenBSD. cross-platform-actions ships an
+  # x86-64-only QEMU, so both VMs run on x86-64 runners: amd64 is
+  # KVM-accelerated and gates the release; arm64 is fully emulated (slow), so
+  # it runs on every push/PR but releases do not wait for it.
   test-openbsd:
-    name: run on OpenBSD (${{ matrix.label }})
+    name: run on OpenBSD (x86_64-unknown-openbsd)
     needs: build-openbsd
-    # cross-platform-actions ships an x86-64-only QEMU, so both VMs run on
-    # x86-64 runners: amd64 is KVM-accelerated, arm64 is emulated (it only
-    # runs the binary, so that is fine).
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: x86_64-unknown-openbsd
-            architecture: x86-64
-          - label: aarch64-unknown-openbsd
-            architecture: arm64
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
-          name: smoke-${{ matrix.label }}
+          name: smoke-x86_64-unknown-openbsd
           path: out
 
       - name: Start OpenBSD VM
         uses: cross-platform-actions/action@v1.6.0
         with:
           operating_system: openbsd
-          architecture: ${{ matrix.architecture }}
+          architecture: x86-64
+          version: "7.9"
+          memory: 4G
+          cpu_count: 4
+
+      - name: Smoke test (inside the VM)
+        shell: cpa.sh {0}
+        run: |
+          chmod +x out/rapidmasque out/tools/*
+          .github/scripts/smoke-test.sh out/rapidmasque out/tools
+
+  test-openbsd-arm64:
+    name: run on OpenBSD (aarch64-unknown-openbsd, emulated)
+    needs: build-openbsd
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: smoke-aarch64-unknown-openbsd
+          path: out
+
+      - name: Start OpenBSD VM
+        uses: cross-platform-actions/action@v1.6.0
+        with:
+          operating_system: openbsd
+          architecture: arm64
           version: "7.9"
           memory: 4G
           cpu_count: 4
