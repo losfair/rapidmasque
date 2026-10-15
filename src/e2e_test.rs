@@ -271,7 +271,11 @@ async fn path_priorities_apply_on_both_ends() {
     tokio::spawn(async move {
         let conn = server.accept().await.unwrap().await.unwrap();
         let _control = h3::open_control(&conn).await.unwrap();
-        tokio::spawn(h3::serve_uni_streams(conn.clone(), Default::default()));
+        tokio::spawn(h3::serve_uni_streams(
+            conn.clone(),
+            Default::default(),
+            None,
+        ));
         let _ = server_tx.send(conn.clone());
         conn.closed().await;
     });
@@ -389,7 +393,7 @@ async fn lossy_path_is_demoted_and_recovers_on_both_ends() {
         let priorities = Arc::new(PathPriorities::default());
         ranking::start(conn.clone(), priorities.clone(), config);
         let _control = h3::open_control(&conn).await.unwrap();
-        tokio::spawn(h3::serve_uni_streams(conn.clone(), priorities));
+        tokio::spawn(h3::serve_uni_streams(conn.clone(), priorities, None));
         let _ = server_tx.send(conn.clone());
         while let Ok(d) = conn.read_datagram().await {
             let _ = conn.send_datagram(d);
@@ -750,10 +754,62 @@ struct Tunnel {
 /// connections in stats registries.
 async fn start_tunnel(
     fx: &Fixture,
-    paths: impl FnOnce(SocketAddr) -> Vec<PathSpec>,
+    paths: impl FnOnce(SocketAddr) -> Vec<PathSpec> + 'static,
     server_stats: Option<Arc<stats::Registry>>,
     client_stats: Option<Arc<stats::Registry>>,
 ) -> Tunnel {
+    start_tunnel_with(
+        fx,
+        TunnelConfig {
+            paths: Box::new(paths),
+            server_stats,
+            client_stats,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
+
+/// Options for [`start_tunnel_with`].
+struct TunnelConfig {
+    /// Extra paths, given the server's address.
+    paths: Box<dyn FnOnce(SocketAddr) -> Vec<PathSpec>>,
+    server_stats: Option<Arc<stats::Registry>>,
+    client_stats: Option<Arc<stats::Registry>>,
+    /// The client's primary path goes here instead of to the server, given
+    /// the server's address (e.g. a relay in front of it).
+    primary_via: Option<Box<dyn FnOnce(SocketAddr) -> BoxFuture<SocketAddr>>>,
+    primary_rate: Option<u64>,
+    max_path_rate: Option<u64>,
+    in_order_delivery: bool,
+}
+
+impl Default for TunnelConfig {
+    fn default() -> Self {
+        Self {
+            paths: Box::new(|_| Vec::new()),
+            server_stats: None,
+            client_stats: None,
+            primary_via: None,
+            primary_rate: None,
+            max_path_rate: None,
+            in_order_delivery: true,
+        }
+    }
+}
+
+async fn start_tunnel_with(fx: &Fixture, cfg: TunnelConfig) -> Tunnel {
+    let TunnelConfig {
+        paths,
+        server_stats,
+        client_stats,
+        primary_via,
+        primary_rate,
+        max_path_rate,
+        in_order_delivery,
+    } = cfg;
     let target = udp_echo().await;
 
     // Server: bind first to learn the port the rule's authority must carry.
@@ -784,6 +840,7 @@ async fn start_tunnel(
     let state = Arc::new(ServerState {
         rules: ArcSwap::from_pointee(rules),
         stats: server_stats,
+        max_path_rate,
     });
     tokio::spawn(server::run(endpoint, state));
 
@@ -791,7 +848,11 @@ async fn start_tunnel(
         let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         s.local_addr().unwrap()
     };
-    let proxy_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let proxy_addr = match primary_via {
+        Some(via) => via(server_addr).await,
+        None => server_addr,
+    };
     let opts = ProxyOptions {
         conn: ConnectParams {
             endpoint: ProxyEndpoint::parse(&format!("https://{HOST}:{port}/connect")).unwrap(),
@@ -800,8 +861,10 @@ async fn start_tunnel(
                 ca_file: Some(fx.cert.clone()),
             },
             ech_config_list: Some(fx.ech_list.clone()),
-            paths: paths(proxy_addr),
+            paths: paths(server_addr),
             primary_priority: 0,
+            primary_rate,
+            in_order_delivery,
             rtable: None,
             path_ranking: Default::default(),
             stats: client_stats,
@@ -994,9 +1057,9 @@ async fn no_congestion_control_never_limits_any_path() {
     }
 }
 
-/// A WireGuard tunnel with MTU 1280 needs 1314-byte HTTP datagrams (1280-byte
+/// A WireGuard tunnel with MTU 1280 needs 1318-byte HTTP datagrams (1280-byte
 /// inner packet + 32 bytes of WireGuard framing + 2 bytes of flow/context
-/// prefix). That must fit from the first packet, not only once DPLPMTUD has
+/// prefix + 4 bytes of sequence number). That must fit from the first packet, not only once DPLPMTUD has
 /// probed the path.
 #[tokio::test(flavor = "multi_thread")]
 async fn wireguard_1280_fits_right_after_handshake() {
@@ -1086,5 +1149,182 @@ async fn idle_extra_path_stays_up_and_fits_wireguard() {
     assert!(
         room >= WIREGUARD_1280_DATAGRAM,
         "datagram room {room} with two paths"
+    );
+}
+
+/// With the primary proxy address dead, the client completes the handshake
+/// over an extra path's proxy address and the tunnel works.
+#[tokio::test(flavor = "multi_thread")]
+async fn handshake_falls_back_to_an_extra_path() {
+    let fx = Fixture::new("fallback");
+    // A bound socket nobody reads: the primary path's handshake gets no answer.
+    let blackhole = std::net::UdpSocket::bind("127.0.0.4:0").unwrap();
+    let dead = blackhole.local_addr().unwrap();
+    let tunnel = start_tunnel_with(
+        &fx,
+        TunnelConfig {
+            paths: Box::new(|server| vec![format!("{server}/priority=1").parse().unwrap()]),
+            primary_via: Some(Box::new(move |_| Box::pin(async move { dead }))),
+            ..Default::default()
+        },
+    )
+    .await;
+    // The fallback waits 3 s for the primary; roundtrip() keeps trying for 10.
+    tunnel.roundtrip().await;
+    drop(blackhole);
+}
+
+/// The fixed-rate window for `rate` bits per second on a loopback path: the
+/// 20 ms floor dominates two loopback round trips and four packets.
+fn fixed_rate_window(rate: u64) -> u64 {
+    rate / 8 / 50
+}
+
+/// The first path's `field` in a stats registry's only connection.
+fn first_path_stat(registry: &stats::Registry, field: &str) -> serde_json::Value {
+    registry.snapshot()["connections"][0]["paths"][0][field].clone()
+}
+
+/// `--primary-rate` sends the primary path at a fixed rate on the client, and
+/// on the proxy too, capped to its `--max-path-rate`.
+#[tokio::test(flavor = "multi_thread")]
+async fn fixed_rate_path_applies_on_both_ends_up_to_the_proxy_cap() {
+    let fx = Fixture::new("fixed-rate");
+    let (server_stats, client_stats) = (
+        stats::Registry::new("server"),
+        stats::Registry::new("client"),
+    );
+    let tunnel = start_tunnel_with(
+        &fx,
+        TunnelConfig {
+            server_stats: Some(server_stats.clone()),
+            client_stats: Some(client_stats.clone()),
+            primary_rate: Some(8_000_000),
+            max_path_rate: Some(4_000_000),
+            ..Default::default()
+        },
+    )
+    .await;
+    tunnel.roundtrip().await;
+
+    let expected = [(&client_stats, 8_000_000u64), (&server_stats, 4_000_000u64)];
+    for _ in 0..50 {
+        let done = expected.iter().all(|(registry, rate)| {
+            first_path_stat(registry, "fixed_rate_bps") == *rate
+                && first_path_stat(registry, "cwnd") == fixed_rate_window(*rate)
+        });
+        if done {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!(
+        "client path {:?}, server path {:?}",
+        client_stats.snapshot()["connections"][0]["paths"][0],
+        server_stats.snapshot()["connections"][0]["paths"][0]
+    );
+}
+
+/// A relay in front of `upstream` that swaps every two consecutive packets
+/// from `upstream` (a held packet goes out after 5 ms without a successor).
+async fn swapping_relay(upstream: SocketAddr) -> SocketAddr {
+    let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = sock.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        let mut client = None;
+        let mut held: Option<Vec<u8>> = None;
+        loop {
+            let received = if held.is_some() {
+                match tokio::time::timeout(Duration::from_millis(5), sock.recv_from(&mut buf)).await
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        if let (Some(packet), Some(c)) = (held.take(), client) {
+                            let _ = sock.send_to(&packet, c).await;
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                sock.recv_from(&mut buf).await
+            };
+            let Ok((n, from)) = received else { return };
+            if from != upstream {
+                client = Some(from);
+                let _ = sock.send_to(&buf[..n], upstream).await;
+                continue;
+            }
+            let Some(c) = client else { continue };
+            match held.take() {
+                None => held = Some(buf[..n].to_vec()),
+                Some(first) => {
+                    let _ = sock.send_to(&buf[..n], c).await;
+                    let _ = sock.send_to(&first, c).await;
+                }
+            }
+        }
+    });
+    addr
+}
+
+/// Send `count` numbered datagrams through the tunnel, paced 2 ms apart, and
+/// return the order their echoes came back in.
+async fn echo_order(tunnel: &Tunnel, count: u32) -> Vec<u32> {
+    let app = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let sender = {
+        let (app, listen) = (app.clone(), tunnel.listen);
+        tokio::spawn(async move {
+            for i in 0..count {
+                let mut payload = i.to_be_bytes().to_vec();
+                payload.resize(1000, 0);
+                app.send_to(&payload, listen).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+    };
+    let mut order = Vec::new();
+    let mut buf = vec![0u8; 2048];
+    while let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(500), app.recv(&mut buf)).await
+    {
+        assert!(n >= 9 && buf.starts_with(b"echo:"));
+        order.push(u32::from_be_bytes(buf[5..9].try_into().unwrap()));
+    }
+    sender.await.unwrap();
+    order
+}
+
+/// Datagrams reordered on the way back arrive in order with in-order delivery
+/// (the default), and out of order without it.
+#[tokio::test(flavor = "multi_thread")]
+async fn in_order_delivery_undoes_reordering() {
+    let fx = Fixture::new("in-order");
+    let mut inversions = Vec::new();
+    for in_order_delivery in [true, false] {
+        let tunnel = start_tunnel_with(
+            &fx,
+            TunnelConfig {
+                primary_via: Some(Box::new(|server| Box::pin(swapping_relay(server)))),
+                in_order_delivery,
+                ..Default::default()
+            },
+        )
+        .await;
+        tunnel.roundtrip().await;
+        // Warm up: the hold time learns how late the relay's swaps are.
+        echo_order(&tunnel, 50).await;
+        let order = echo_order(&tunnel, 200).await;
+        assert!(order.len() >= 190, "{} of 200 echoes", order.len());
+        inversions.push(order.windows(2).filter(|w| w[1] < w[0]).count());
+    }
+    // A swap delayed beyond the learned hold time (a busy test machine) is
+    // still delivered, late; allow a couple.
+    assert!(
+        inversions[0] <= 2,
+        "reordered with in-order delivery: {inversions:?}"
+    );
+    assert!(
+        inversions[1] > 20,
+        "the relay did not reorder: {inversions:?}"
     );
 }

@@ -24,6 +24,7 @@ use crate::dgram;
 use crate::h3::{self, FrameReader};
 use crate::quic::{self, CAPSULE_PROTOCOL_TRUE};
 use crate::ranking::PathPriorities;
+use crate::reorder::Reorder;
 use crate::rules::RuleTable;
 use crate::stats;
 use crate::tls::HandshakeData;
@@ -40,11 +41,14 @@ pub struct ServerState {
     pub rules: ArcSwap<RuleTable>,
     /// Connections listed on the stats endpoint, if enabled.
     pub stats: Option<Arc<stats::Registry>>,
+    /// Largest fixed path rate a client may ask for (`--max-path-rate`).
+    pub max_path_rate: Option<u64>,
 }
 
 /// Client→target side of one active flow, as seen by the datagram dispatcher.
 struct FlowHandle {
-    to_target: mpsc::Sender<Bytes>,
+    /// Payloads with their sequence numbers, if the client numbers them.
+    to_target: mpsc::Sender<(Option<u32>, Bytes)>,
     activity: Arc<Activity>,
 }
 
@@ -105,7 +109,11 @@ async fn handle_connection(incoming: Incoming, state: Arc<ServerState>) -> Resul
     // Our control stream must stay open for the connection's lifetime.
     let _control = h3::open_control(&conn).await?;
     let priorities = Arc::new(PathPriorities::default());
-    tokio::spawn(h3::serve_uni_streams(conn.clone(), priorities.clone()));
+    tokio::spawn(h3::serve_uni_streams(
+        conn.clone(),
+        priorities.clone(),
+        state.max_path_rate,
+    ));
     tokio::spawn(quic::log_path_events(conn.clone()));
 
     let flows: FlowMap = Arc::new(Mutex::new(HashMap::new()));
@@ -155,20 +163,21 @@ async fn dispatch_datagrams(conn: Connection, flows: FlowMap) {
         let Some(parsed) = dgram::decode(&datagram) else {
             continue;
         };
-        if parsed.context_id != dgram::CONTEXT_ID_UDP {
-            continue; // only raw UDP payloads are supported
-        }
+        // Only (sequenced) UDP payloads are supported.
+        let Some((seq, payload)) = dgram::udp_payload(&parsed) else {
+            continue;
+        };
         let flows = flows.lock().unwrap();
         match flows.get(&parsed.flow_id) {
             Some(flow) => {
                 log::debug!(
                     "client datagram flow {} -> target: {} bytes",
                     parsed.flow_id,
-                    parsed.payload.len()
+                    payload.len()
                 );
                 // Drop on full: UDP is lossy by contract.
-                let payload = datagram.slice_ref(parsed.payload);
-                let _ = flow.to_target.try_send(payload);
+                let payload = datagram.slice_ref(payload);
+                let _ = flow.to_target.try_send((seq, payload));
                 // Client→target traffic keeps the flow alive.
                 flow.activity.touch();
             }
@@ -227,7 +236,7 @@ async fn handle_request(
         }
     };
 
-    let (to_target_tx, to_target_rx) = mpsc::channel::<Bytes>(CHANNEL_CAP);
+    let (to_target_tx, to_target_rx) = mpsc::channel::<(Option<u32>, Bytes)>(CHANNEL_CAP);
     let activity = Arc::new(Activity::new());
     flows.lock().unwrap().insert(
         flow_id,
@@ -244,19 +253,27 @@ async fn handle_request(
     if let Some(mark) = rule.fwmark {
         extra.push_str(&format!(" fwmark {mark}"));
     }
+    if req.sequenced {
+        extra.push_str(" in order");
+    }
     log::info!("CONNECT-UDP flow {flow_id} -> {}{extra}", rule.target);
 
     // Keep the stream open (no FIN) so datagrams keep flowing.
-    let response = h3::headers_frame(&[
+    let mut fields = vec![
         (":status", "200"),
         ("capsule-protocol", CAPSULE_PROTOCOL_TRUE),
-    ]);
+    ];
+    if req.sequenced {
+        fields.push((dgram::SEQUENCE_HEADER, dgram::SEQUENCE_HEADER_ON));
+    }
+    let response = h3::headers_frame(&fields);
     if let Err(e) = send.write_all(&response).await {
         log::warn!("failed to send CONNECT-UDP 200 response: {e}");
     } else {
         relay_flow(
             &conn,
             flow_id,
+            req.sequenced,
             &target,
             to_target_rx,
             &mut send,
@@ -271,32 +288,57 @@ async fn handle_request(
 
 /// Relay one flow until the client closes its request stream, the connection
 /// dies, or the flow idles out (which resets the stream so the client frees it
-/// and reopens lazily on its next datagram).
+/// and reopens lazily on its next datagram). With `sequenced`, replies carry
+/// sequence numbers; numbered datagrams from the client are delivered to the
+/// target in order (`crate::reorder`).
 #[allow(clippy::too_many_arguments)]
 async fn relay_flow(
     conn: &Connection,
     flow_id: u64,
+    sequenced: bool,
     target: &UdpSocket,
-    mut from_client: mpsc::Receiver<Bytes>,
+    mut from_client: mpsc::Receiver<(Option<u32>, Bytes)>,
     send: &mut SendStream,
     reader: &mut FrameReader,
     activity: &Activity,
     idle_timeout: Option<Duration>,
 ) {
     let mut buf = vec![0u8; RECV_BUF];
+    let mut next_seq = 0u32;
+    let mut reorder: Option<Reorder> = None;
+    let mut ready: Vec<Bytes> = Vec::new();
     loop {
+        for payload in ready.drain(..) {
+            if let Err(e) = target.send(&payload).await {
+                log::debug!("send to target failed: {e}");
+            }
+        }
         let deadline = idle_timeout.map(|d| activity.last() + d);
+        let reorder_deadline = reorder.as_ref().and_then(Reorder::deadline);
         tokio::select! {
             maybe = from_client.recv() => {
-                let Some(payload) = maybe else { break };
-                if let Err(e) = target.send(&payload).await {
-                    log::debug!("send to target failed: {e}");
+                let Some((seq, payload)) = maybe else { break };
+                match seq {
+                    Some(seq) => reorder
+                        .get_or_insert_with(|| Reorder::new(std::time::Instant::now()))
+                        .push(seq, payload, std::time::Instant::now(), &mut ready),
+                    None => ready.push(payload),
+                }
+            }
+            _ = sleep_until_opt(reorder_deadline.map(Instant::from_std)) => {
+                if let Some(reorder) = reorder.as_mut() {
+                    reorder.on_timeout(std::time::Instant::now(), &mut ready);
                 }
             }
             r = target.recv(&mut buf) => match r {
                 Ok(n) => {
                     activity.touch();
-                    let datagram = Bytes::from(dgram::encode(flow_id, &buf[..n]));
+                    let seq = sequenced.then(|| {
+                        let seq = next_seq;
+                        next_seq = next_seq.wrapping_add(1);
+                        seq
+                    });
+                    let datagram = Bytes::from(dgram::encode_udp(flow_id, seq, &buf[..n]));
                     if !quic::send_datagram(conn, flow_id, datagram, "reply") {
                         break;
                     }
@@ -331,6 +373,9 @@ async fn sleep_until_opt(deadline: Option<Instant>) {
 struct ConnectRequest {
     authority: String,
     path: String,
+    /// The client numbers its datagrams and wants ours numbered
+    /// ([`dgram::SEQUENCE_HEADER`]).
+    sequenced: bool,
 }
 
 impl ConnectRequest {
@@ -351,6 +396,8 @@ impl ConnectRequest {
         Ok(Self {
             authority: text(":authority")?,
             path: text(":path")?,
+            sequenced: h3::header(fields, dgram::SEQUENCE_HEADER)
+                == Some(dgram::SEQUENCE_HEADER_ON.as_bytes()),
         })
     }
 }

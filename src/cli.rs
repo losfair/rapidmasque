@@ -63,6 +63,14 @@ pub struct ServeArgs {
     #[command(flatten)]
     pub transport: TransportArgs,
 
+    /// Largest fixed sending rate a client may ask for on a path
+    /// (`--path .../rate=RATE`, `--primary-rate` on the client), in bits per
+    /// second (e.g. `100M`); larger requests are capped to it. A fixed-rate
+    /// path is sent on without congestion control, so without this option
+    /// such requests are ignored and every path stays congestion-controlled.
+    #[arg(long, value_name = "RATE", value_parser = crate::cc::parse_rate)]
+    pub max_path_rate: Option<u64>,
+
     /// Serve a JSON stats snapshot (connections, multipath paths, priorities,
     /// ranking, RTT, loss, traffic) over plain HTTP at `http://ADDR/stats`.
     /// Off by default. No TLS or authentication and it reveals peer
@@ -92,17 +100,23 @@ pub struct ClientArgs {
     pub proxy_addr: Option<SocketAddr>,
 
     /// Open an additional QUIC multipath path, as
-    /// `REMOTE_IP:PORT[@LOCAL_IP][/backup][/priority=N][/rtable=N]`. `REMOTE` is a proxy
+    /// `REMOTE_IP:PORT[@LOCAL_IP][/backup][/priority=N][/rate=RATE][/rtable=N]`. `REMOTE` is a proxy
     /// address (it may differ from the primary one), `LOCAL_IP` pins the
     /// path's source address (e.g. a second uplink's address), and `/backup`
     /// makes it a standby path used only when no primary path works.
     /// `/priority=N` (0-255, default 0, lower is preferred) orders usable
     /// paths in both directions: traffic fills the preferred path first and
     /// spills onto the next ones (see `--path-spill-threshold-ms`); equal
-    /// priorities share traffic. `/rtable=N` (OpenBSD) sends the path through
+    /// priorities share traffic. `/rate=RATE` (bits per second, e.g. `48M`)
+    /// sends on the path at that fixed rate instead of under congestion
+    /// control, in both directions (the proxy needs `--max-path-rate`): for a
+    /// link of known, dedicated capacity, set a little below it to leave room
+    /// for IP/UDP headers. `/rtable=N` (OpenBSD) sends the path through
     /// routing table N (rtable(4)); such a path needs a remote, or remote and
     /// `@LOCAL_IP`, that no other path uses. Repeatable. Paths that fail are
-    /// retried while the tunnel is up.
+    /// retried while the tunnel is up. If the primary path cannot complete
+    /// the handshake, the client tries these paths' proxy addresses in
+    /// priority order.
     #[arg(long = "path", value_name = "SPEC")]
     pub paths: Vec<PathSpec>,
 
@@ -110,6 +124,20 @@ pub struct ClientArgs {
     /// terms as `--path .../priority=N`. Only meaningful with `--path`.
     #[arg(long, value_name = "N", default_value_t = 0)]
     pub primary_priority: u8,
+
+    /// Fixed sending rate for the primary path, in the same terms as
+    /// `--path .../rate=RATE`.
+    #[arg(long, value_name = "RATE", value_parser = crate::cc::parse_rate)]
+    pub primary_rate: Option<u64>,
+
+    /// Deliver each flow's datagrams in order: datagrams that overtake others
+    /// (e.g. while traffic spills across paths with different delays) wait
+    /// for the ones before them, up to a hold time that follows the observed
+    /// reordering (at most 250 ms). Needs a rapidmasque proxy on the other
+    /// end and costs 4 bytes per datagram; the proxy does the same for its
+    /// replies. `false` sends plain RFC 9298 datagrams.
+    #[arg(long, value_name = "BOOL", default_value_t = true, action = clap::ArgAction::Set)]
+    pub in_order_delivery: bool,
 
     /// OpenBSD routing table (rtable(4)) for the primary path and every
     /// `--path` without its own `/rtable=N`. Defaults to the process's table

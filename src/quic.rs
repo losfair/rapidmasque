@@ -46,9 +46,10 @@ const DGRAM_RECV_BUFFER: usize = 8 * 1024 * 1024;
 /// HTTP datagram size for a full-size packet of a 1280-MTU WireGuard tunnel: a
 /// 1280-byte inner packet inside WireGuard is a 1312-byte UDP payload (16B
 /// header + 16B tag), plus our 2B HTTP-datagram prefix (quarter-stream ID +
-/// context ID) = 1314B. It must fit in one QUIC DATAGRAM frame, which cannot
-/// be fragmented.
-pub(crate) const WIREGUARD_1280_DATAGRAM: usize = 1280 + 32 + 2;
+/// context ID) and the 4B sequence number of in-order delivery
+/// (`crate::reorder`) = 1318B. It must fit in one QUIC DATAGRAM frame, which
+/// cannot be fragmented.
+pub(crate) const WIREGUARD_1280_DATAGRAM: usize = 1280 + 32 + 2 + crate::dgram::SEQUENCE_LEN;
 
 /// noq's per-packet bound on DATAGRAM overhead (`Datagrams::max_size`): flags
 /// byte (1) + destination CID (8, noq's default CID length, which every
@@ -58,17 +59,17 @@ pub(crate) const WIREGUARD_1280_DATAGRAM: usize = 1280 + 32 + 2;
 const DATAGRAM_OVERHEAD: usize = 1 + 8 + 4 + 16 + 9;
 
 /// Default initial and minimum outer (client<->proxy) QUIC packet size, i.e. UDP
-/// payload bytes: exactly what a 1280-MTU WireGuard packet needs (1352).
+/// payload bytes: exactly what a 1280-MTU WireGuard packet needs (1356).
 /// noq's default of 1200 leaves only 1162B, so until DPLPMTUD had probed the
 /// path upward (and indefinitely where probing never succeeds) every
 /// full-size packet would be dropped. It is also the floor: DPLPMTUD may raise
 /// the size (up to 1452) but its black-hole detection never lowers it below
 /// this, because shrinking would silently stop the tunnel from carrying
 /// full-size inner packets. The client<->proxy path must therefore carry
-/// 1380-byte IPv4 / 1400-byte IPv6 packets; on a path that cannot, large
+/// 1384-byte IPv4 / 1404-byte IPv6 packets; on a path that cannot, large
 /// packets are lost rather than the tunnel narrowing. Override with `--min-mtu`.
 pub(crate) const DEFAULT_MIN_MTU: u16 = (WIREGUARD_1280_DATAGRAM + DATAGRAM_OVERHEAD) as u16;
-const _: () = assert!(DEFAULT_MIN_MTU == 1352);
+const _: () = assert!(DEFAULT_MIN_MTU == 1356);
 
 /// Size requested (per direction) for every UDP socket's kernel buffers.
 ///

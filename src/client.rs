@@ -27,6 +27,7 @@ use crate::endpoint::Endpoint as ProxyEndpoint;
 use crate::h3::{self, FrameReader};
 use crate::quic::{self, CAPSULE_PROTOCOL_TRUE, TransportOptions, Verify, send_datagram};
 use crate::ranking::{self, PathPriorities, PathRanking, RankingConfig};
+use crate::reorder::Reorder;
 use crate::routed_socket;
 use crate::stats;
 use crate::tls::HandshakeData;
@@ -49,9 +50,13 @@ const PATH_WARN_AFTER: u32 = 3;
 /// How long the primary path's maintainer waits for the handshake path to
 /// learn its source address (see [`primary_path_spec`]).
 const PRIMARY_LOCAL_IP_WAIT: Duration = Duration::from_secs(5);
+/// How long a handshake path gets before the client tries the next candidate
+/// (see [`handshake_candidates`]); the last candidate gets the full handshake
+/// timeout.
+const HANDSHAKE_FALLBACK_AFTER: Duration = Duration::from_secs(3);
 
 /// An extra multipath path:
-/// `REMOTE_IP:PORT[@LOCAL_IP][/backup][/priority=N][/rtable=N]`.
+/// `REMOTE_IP:PORT[@LOCAL_IP][/backup][/priority=N][/rate=RATE][/rtable=N]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathSpec {
     pub remote: SocketAddr,
@@ -59,8 +64,25 @@ pub struct PathSpec {
     pub backup: bool,
     /// Scheduling priority, lower is preferred (noq `Path::set_priority`).
     pub priority: u8,
+    /// Fixed sending rate (bits per second) in place of congestion control,
+    /// for a link of known, dedicated capacity (`crate::cc::FixedRate`).
+    pub rate: Option<u64>,
     /// OpenBSD routing table to send this path's packets through.
     pub rtable: Option<u32>,
+}
+
+impl PathSpec {
+    /// A path to `remote` with `priority` and no other options.
+    pub fn to(remote: SocketAddr, priority: u8) -> Self {
+        Self {
+            remote,
+            local_ip: None,
+            backup: false,
+            priority,
+            rate: None,
+            rtable: None,
+        }
+    }
 }
 
 impl FromStr for PathSpec {
@@ -72,6 +94,7 @@ impl FromStr for PathSpec {
         let mut backup = false;
         let mut priority = 0;
         let mut rtable = None;
+        let mut rate = None;
         for option in options {
             if option == "backup" {
                 backup = true;
@@ -84,9 +107,12 @@ impl FromStr for PathSpec {
                     n.parse()
                         .map_err(|e| format!("bad routing table {n:?}: {e}"))?,
                 );
+            } else if let Some(r) = option.strip_prefix("rate=") {
+                rate = Some(crate::cc::parse_rate(r)?);
             } else {
                 return Err(format!(
-                    "unknown path option {option:?} (expected backup, priority=N or rtable=N)"
+                    "unknown path option {option:?} (expected backup, priority=N, rate=RATE \
+                     or rtable=N)"
                 ));
             }
         }
@@ -106,6 +132,7 @@ impl FromStr for PathSpec {
             local_ip,
             backup,
             priority,
+            rate,
             rtable,
         })
     }
@@ -122,6 +149,9 @@ impl fmt::Display for PathSpec {
         }
         if self.priority != 0 {
             write!(f, "/priority={}", self.priority)?;
+        }
+        if let Some(rate) = self.rate {
+            write!(f, "/rate={}", crate::cc::format_rate(rate))?;
         }
         if let Some(rtable) = self.rtable {
             write!(f, "/rtable={rtable}")?;
@@ -142,6 +172,11 @@ pub struct ConnectParams {
     pub paths: Vec<PathSpec>,
     /// Scheduling priority of the primary path (only used with `paths`).
     pub primary_priority: u8,
+    /// Fixed sending rate of the primary path (bits per second).
+    pub primary_rate: Option<u64>,
+    /// Ask the proxy for sequenced datagrams and deliver each flow in order
+    /// (`crate::reorder`).
+    pub in_order_delivery: bool,
     /// OpenBSD routing table of the client's main socket: the primary path
     /// and every path without its own `rtable`.
     pub rtable: Option<u32>,
@@ -211,6 +246,29 @@ struct Dialed {
     endpoint: Endpoint,
     conn: Connection,
     proxy_addr: SocketAddr,
+    /// Where the handshake went: `proxy_addr`, or an extra path's proxy
+    /// address if the primary path did not answer.
+    handshake_addr: SocketAddr,
+}
+
+/// Proxy addresses to try the handshake on, in order: the primary, then the
+/// extra paths' remotes by priority (`/backup` paths last). Only paths
+/// without `@LOCAL_IP` qualify, and only remotes other than the primary's: a
+/// handshake cannot pick its source address, and the path it creates must not
+/// be mistaken for another configured path (see [`primary_path_spec`]).
+fn handshake_candidates(proxy_addr: SocketAddr, paths: &[PathSpec]) -> Vec<SocketAddr> {
+    let mut extra: Vec<&PathSpec> = paths
+        .iter()
+        .filter(|spec| spec.local_ip.is_none() && spec.remote != proxy_addr)
+        .collect();
+    extra.sort_by_key(|spec| (spec.backup, spec.priority));
+    let mut out = vec![proxy_addr];
+    for spec in extra {
+        if !out.contains(&spec.remote) {
+            out.push(spec.remote);
+        }
+    }
+    out
 }
 
 async fn dial(p: &ConnectParams) -> Result<Dialed> {
@@ -252,17 +310,44 @@ async fn dial(p: &ConnectParams) -> Result<Dialed> {
     }
     .context("creating QUIC endpoint")?;
 
-    log::info!("connecting to proxy {proxy_addr} (sni={server_name})");
-    let conn = endpoint
-        .connect_with(config, proxy_addr, &server_name)
-        .map_err(|e| anyhow!("connect: {e}"))?
-        .await
-        .context("QUIC handshake")?;
-    Ok(Dialed {
-        endpoint,
-        conn,
-        proxy_addr,
-    })
+    let candidates = handshake_candidates(proxy_addr, &p.paths);
+    let mut failure = None;
+    for (i, &remote) in candidates.iter().enumerate() {
+        log::info!("connecting to proxy {remote} (sni={server_name})");
+        let connecting = endpoint
+            .connect_with(config.clone(), remote, &server_name)
+            .map_err(|e| anyhow!("connect: {e}"))?;
+        let result = if i + 1 == candidates.len() {
+            Ok(connecting.await)
+        } else {
+            tokio::time::timeout(HANDSHAKE_FALLBACK_AFTER, connecting).await
+        };
+        match result {
+            Ok(Ok(conn)) => {
+                if remote != proxy_addr {
+                    log::warn!(
+                        "primary path to {proxy_addr} unavailable; tunnel established over \
+                         {remote}"
+                    );
+                }
+                return Ok(Dialed {
+                    endpoint,
+                    conn,
+                    proxy_addr,
+                    handshake_addr: remote,
+                });
+            }
+            Ok(Err(e)) => {
+                log::warn!("QUIC handshake via {remote} failed: {e}");
+                failure = Some(anyhow!(e).context("QUIC handshake"));
+            }
+            Err(_) => log::warn!(
+                "QUIC handshake via {remote}: no answer within {HANDSHAKE_FALLBACK_AFTER:?}; \
+                 trying the next path"
+            ),
+        }
+    }
+    Err(failure.unwrap_or_else(|| anyhow!("QUIC handshake: no path answered")))
 }
 
 /// One local source's flow state.
@@ -278,6 +363,28 @@ struct FlowState {
     established: bool,
     /// Datagrams buffered until the flow is established.
     pending: Vec<Bytes>,
+    /// Sequence number of the next datagram, if the proxy agreed to numbered
+    /// datagrams.
+    next_seq: Option<u32>,
+}
+
+impl FlowState {
+    /// `data` as an HTTP datagram for flow `fid`, numbered if agreed.
+    fn encode(&mut self, fid: u64, data: &[u8]) -> Bytes {
+        let seq = self.next_seq;
+        if let Some(seq) = seq {
+            self.next_seq = Some(seq.wrapping_add(1));
+        }
+        dgram::encode_udp(fid, seq, data).into()
+    }
+}
+
+/// A flow as seen by datagrams arriving from the proxy.
+struct TunnelFlow {
+    /// The local source the flow belongs to.
+    src: SocketAddr,
+    /// Puts numbered datagrams back in order, once the first arrives.
+    reorder: Option<Reorder>,
 }
 
 /// Progress reports from per-flow request tasks to the session loop.
@@ -290,6 +397,8 @@ enum FlowEvent {
     Accepted {
         src: SocketAddr,
         token: u64,
+        /// The proxy numbers its datagrams and accepts numbered ones.
+        sequenced: bool,
     },
     Closed {
         src: SocketAddr,
@@ -309,6 +418,7 @@ async fn run_session(
         endpoint,
         conn,
         proxy_addr,
+        handshake_addr,
     } = match dial(p).await {
         Ok(d) => d,
         Err(e) => {
@@ -340,7 +450,12 @@ async fn run_session(
         }
     };
     let priorities = Arc::new(PathPriorities::default());
-    tokio::spawn(h3::serve_uni_streams(conn.clone(), priorities.clone()));
+    // The proxy never asks this end for fixed path rates.
+    tokio::spawn(h3::serve_uni_streams(
+        conn.clone(),
+        priorities.clone(),
+        None,
+    ));
     tokio::spawn(quic::log_path_events(conn.clone()));
     if !p.paths.is_empty() && p.path_ranking == PathRanking::Auto && conn.is_multipath_enabled() {
         // Rank what we send, and ask the proxy to rank what it sends.
@@ -354,9 +469,16 @@ async fn run_session(
         // away) while extra paths carry the tunnel, re-open it once it works.
         tokio::spawn({
             let (conn, control, priorities) = (conn.clone(), control.clone(), priorities.clone());
-            let (paths, priority) = (p.paths.clone(), p.primary_priority);
+            let (paths, priority, rate) = (p.paths.clone(), p.primary_priority, p.primary_rate);
             async move {
-                let primary = primary_path_spec(&conn, proxy_addr, &paths, priority).await;
+                let mut primary = if handshake_addr == proxy_addr {
+                    primary_path_spec(&conn, proxy_addr, &paths, priority).await
+                } else {
+                    // The handshake went over an extra path (path 0 is that
+                    // path), so the primary is opened like any other path.
+                    PathSpec::to(proxy_addr, priority)
+                };
+                primary.rate = rate;
                 maintain_path(conn, primary, control, priorities).await
             }
         });
@@ -368,6 +490,13 @@ async fn run_session(
                 priorities.clone(),
             ));
         }
+    } else if let Some(rate) = p.primary_rate {
+        // A single path: give it its fixed rate here.
+        if priorities.set_rate(&conn, PathId::ZERO, rate)
+            && let Err(e) = control.send_path_rate(PathId::ZERO, rate).await
+        {
+            log::warn!("announcing the primary path's rate failed: {e:#}");
+        }
     }
     log::info!(
         "tunnel established (ech={ech}, multipath={})",
@@ -378,7 +507,8 @@ async fn run_session(
     let path: Arc<str> = p.endpoint.path.as_str().into();
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<FlowEvent>();
     let mut by_addr: HashMap<SocketAddr, FlowState> = HashMap::new();
-    let mut flows: HashMap<u64, SocketAddr> = HashMap::new();
+    let mut flows: HashMap<u64, TunnelFlow> = HashMap::new();
+    let mut ready: Vec<Bytes> = Vec::new();
     let mut next_token = 0u64;
     let flow_count = Arc::new(AtomicUsize::new(0));
     let _stats = p.stats.as_ref().map(|registry| {
@@ -389,6 +519,7 @@ async fn run_session(
             serde_json::json!({
                 "endpoint": p.endpoint.authority,
                 "proxy_addr": proxy_addr.to_string(),
+                "handshake_addr": handshake_addr.to_string(),
                 "ech": ech,
             }),
             move || flow_count.load(Ordering::Relaxed),
@@ -414,6 +545,7 @@ async fn run_session(
                             path.clone(),
                             src,
                             next_token,
+                            p.in_order_delivery,
                             ev_tx.clone(),
                         ));
                         FlowState {
@@ -421,12 +553,13 @@ async fn run_session(
                             flow_id: None,
                             established: false,
                             pending: Vec::new(),
+                            next_seq: None,
                         }
                     });
                     match (st.established, st.flow_id) {
                         (true, Some(fid)) => {
                             log::debug!("-> tunnel flow {fid}: {} bytes", data.len());
-                            send_datagram(&conn, fid, dgram::encode(fid, &data).into(), "local");
+                            send_datagram(&conn, fid, st.encode(fid, &data), "local");
                         }
                         _ => {
                             if st.pending.len() < MAX_PENDING {
@@ -437,25 +570,42 @@ async fn run_session(
                 }
             }
             datagram = conn.read_datagram() => match datagram {
-                Ok(d) => route_tunnel_datagram(lsock, &flows, &d).await,
+                Ok(d) => {
+                    if let Some(src) = take_tunnel_datagram(&mut flows, d, &mut ready) {
+                        deliver_local(lsock, src, &mut ready).await;
+                    }
+                }
                 Err(e) => break e.to_string(),
+            },
+            _ = sleep_until_opt(next_reorder_deadline(&flows)) => {
+                let now = std::time::Instant::now();
+                for flow in flows.values_mut() {
+                    if let Some(reorder) = flow.reorder.as_mut() {
+                        reorder.on_timeout(now, &mut ready);
+                    }
+                    deliver_local(lsock, flow.src, &mut ready).await;
+                }
             },
             Some(ev) = ev_rx.recv() => match ev {
                 FlowEvent::Opened { src, token, flow_id } => {
                     if let Some(st) = by_addr.get_mut(&src).filter(|st| st.token == token) {
                         st.flow_id = Some(flow_id);
-                        flows.insert(flow_id, src);
+                        flows.insert(flow_id, TunnelFlow { src, reorder: None });
                         log::info!("opened flow {flow_id} for local {src}");
                     }
                 }
-                FlowEvent::Accepted { src, token } => {
+                FlowEvent::Accepted { src, token, sequenced } => {
                     if let Some(st) = by_addr.get_mut(&src).filter(|st| st.token == token)
                         && let Some(fid) = st.flow_id
                     {
                         // The server has created the flow; release buffered data.
                         st.established = true;
+                        if sequenced {
+                            st.next_seq = Some(0);
+                        }
                         for data in std::mem::take(&mut st.pending) {
-                            send_datagram(&conn, fid, dgram::encode(fid, &data).into(), "local");
+                            let datagram = st.encode(fid, &data);
+                            send_datagram(&conn, fid, datagram, "local");
                         }
                     }
                 }
@@ -484,6 +634,7 @@ async fn open_flow(
     path: Arc<str>,
     src: SocketAddr,
     token: u64,
+    in_order: bool,
     events: mpsc::UnboundedSender<FlowEvent>,
 ) {
     let closed = |events: &mpsc::UnboundedSender<FlowEvent>| {
@@ -503,14 +654,18 @@ async fn open_flow(
         flow_id,
     });
 
-    let request = h3::headers_frame(&[
+    let mut fields = vec![
         (":method", "CONNECT"),
         (":protocol", "connect-udp"),
         (":scheme", "https"),
-        (":authority", &authority),
-        (":path", &path),
+        (":authority", &*authority),
+        (":path", &*path),
         ("capsule-protocol", CAPSULE_PROTOCOL_TRUE),
-    ]);
+    ];
+    if in_order {
+        fields.push((dgram::SEQUENCE_HEADER, dgram::SEQUENCE_HEADER_ON));
+    }
+    let request = h3::headers_frame(&fields);
     if let Err(e) = send.write_all(&request).await {
         log::warn!("send_request for {src} failed: {e}");
         return closed(&events);
@@ -522,8 +677,15 @@ async fn open_flow(
             Ok(Some(fields)) => match h3::status_of(&fields) {
                 Some(s) if (100..200).contains(&s) => continue, // interim
                 Some(s) if (200..300).contains(&s) => {
-                    log::debug!("flow {flow_id} accepted (status {s})");
-                    let _ = events.send(FlowEvent::Accepted { src, token });
+                    let sequenced = in_order
+                        && h3::header(&fields, dgram::SEQUENCE_HEADER)
+                            == Some(dgram::SEQUENCE_HEADER_ON.as_bytes());
+                    log::debug!("flow {flow_id} accepted (status {s}, in order: {sequenced})");
+                    let _ = events.send(FlowEvent::Accepted {
+                        src,
+                        token,
+                        sequenced,
+                    });
                     break;
                 }
                 status => {
@@ -547,18 +709,51 @@ async fn open_flow(
     drop(send);
 }
 
-/// Forward a tunnelled datagram back to the local source for its flow.
-async fn route_tunnel_datagram(lsock: &UdpSocket, flows: &HashMap<u64, SocketAddr>, d: &[u8]) {
-    let Some(p) = dgram::decode(d) else {
-        return;
-    };
-    if p.context_id != dgram::CONTEXT_ID_UDP {
-        return;
+/// Take in a datagram from the proxy: its flow's payloads that are now
+/// deliverable, in order, are appended to `ready`. Returns the flow's local
+/// source.
+fn take_tunnel_datagram(
+    flows: &mut HashMap<u64, TunnelFlow>,
+    d: Bytes,
+    ready: &mut Vec<Bytes>,
+) -> Option<SocketAddr> {
+    let p = dgram::decode(&d)?;
+    let (seq, payload) = dgram::udp_payload(&p)?;
+    let flow = flows.get_mut(&p.flow_id)?;
+    let payload = d.slice_ref(payload);
+    match seq {
+        Some(seq) => {
+            let now = std::time::Instant::now();
+            flow.reorder
+                .get_or_insert_with(|| Reorder::new(now))
+                .push(seq, payload, now, ready);
+        }
+        None => ready.push(payload),
     }
-    if let Some(src) = flows.get(&p.flow_id)
-        && let Err(e) = lsock.send_to(p.payload, *src).await
-    {
-        log::debug!("send to local {src} failed: {e}");
+    Some(flow.src)
+}
+
+/// Send `ready` payloads to local source `src`.
+async fn deliver_local(lsock: &UdpSocket, src: SocketAddr, ready: &mut Vec<Bytes>) {
+    for payload in ready.drain(..) {
+        if let Err(e) = lsock.send_to(&payload, src).await {
+            log::debug!("send to local {src} failed: {e}");
+        }
+    }
+}
+
+/// The earliest time a flow gives up waiting for a missing datagram.
+fn next_reorder_deadline(flows: &HashMap<u64, TunnelFlow>) -> Option<std::time::Instant> {
+    flows
+        .values()
+        .filter_map(|flow| flow.reorder.as_ref()?.deadline())
+        .min()
+}
+
+async fn sleep_until_opt(deadline: Option<std::time::Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(d.into()).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -632,11 +827,8 @@ pub(crate) async fn primary_path_spec(
         None
     };
     PathSpec {
-        remote: proxy_addr,
         local_ip,
-        backup: false,
-        priority,
-        rtable: None,
+        ..PathSpec::to(proxy_addr, priority)
     }
 }
 
@@ -675,6 +867,12 @@ pub(crate) async fn maintain_path(
                     priorities.set_base(&conn, path.id(), spec.priority);
                     if let Err(e) = control.send_path_priority(path.id(), spec.priority).await {
                         log::debug!("multipath path {spec}: announcing priority: {e:#}");
+                    }
+                    if let Some(rate) = spec.rate
+                        && priorities.set_rate(&conn, path.id(), rate)
+                        && let Err(e) = control.send_path_rate(path.id(), rate).await
+                    {
+                        log::debug!("multipath path {spec}: announcing rate: {e:#}");
                     }
                 }
                 failures = 0;

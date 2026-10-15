@@ -148,6 +148,7 @@ fn connection_stats(entry: &Entry) -> Value {
                 "base_priority": entry.base,
                 "demoted": entry.demoted,
                 "ranked_loss": entry.loss,
+                "fixed_rate_bps": entry.rate,
                 "rtt_ms": millis(s.rtt),
                 "cwnd": s.cwnd,
                 "mtu": s.current_mtu,

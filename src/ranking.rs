@@ -112,6 +112,8 @@ pub struct PathEntry {
     pub demoted: bool,
     /// Smoothed loss rate of what this end sends on the path, once sampled.
     pub loss: Option<f64>,
+    /// Fixed sending rate (bits per second) in place of congestion control.
+    pub rate: Option<u64>,
 }
 
 impl PathEntry {
@@ -131,6 +133,27 @@ impl PathPriorities {
     /// Set a path's configured priority and apply the result to noq.
     pub fn set_base(&self, conn: &Connection, path_id: PathId, base: u8) {
         self.update(conn, path_id, |e| e.base = base);
+    }
+
+    /// Send on a path at a fixed `rate` (bits per second) instead of under
+    /// congestion control (`crate::cc::FixedRate`). Returns `false` if the
+    /// path is gone.
+    pub fn set_rate(&self, conn: &Connection, path_id: PathId, rate: u64) -> bool {
+        let Some(path) = conn.path(path_id) else {
+            return false;
+        };
+        let factory = Arc::new(crate::cc::FixedRateFactory { rate });
+        if path.set_congestion_controller(factory).is_err() {
+            return false;
+        }
+        self.inner
+            .lock()
+            .unwrap()
+            .paths
+            .entry(path_id)
+            .or_default()
+            .rate = Some(rate);
+        true
     }
 
     /// Whether automatic ranking runs on this connection.
@@ -610,7 +633,7 @@ mod tests {
         let entry = |base, demoted| PathEntry {
             base,
             demoted,
-            loss: None,
+            ..Default::default()
         };
         assert_eq!(entry(3, true).effective(false), 3);
         assert_eq!(entry(0, false).effective(true), 0);

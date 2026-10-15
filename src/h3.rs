@@ -10,8 +10,9 @@
 //!
 //! Two extensions on the control stream: the client announces its multipath
 //! path priorities ([`FRAME_PATH_PRIORITY`]) so the proxy prefers the same
-//! paths for the return direction, and asks the proxy to rank paths by loss
-//! too ([`FRAME_PATH_RANKING`]).
+//! paths for the return direction, asks the proxy to rank paths by loss too
+//! ([`FRAME_PATH_RANKING`]), and announces paths that send at a fixed rate
+//! ([`FRAME_PATH_RATE`]).
 
 use std::sync::Arc;
 
@@ -39,6 +40,12 @@ pub const FRAME_PATH_PRIORITY: u64 = 0x726d_7070;
 /// Payload: mode varint, 1 = auto. "rmpr" in ASCII.
 pub const FRAME_PATH_RANKING: u64 = 0x726d_7072;
 const PATH_RANKING_AUTO: u64 = 1;
+/// rapidmasque extension frame on the control stream: send on one multipath
+/// path at a fixed rate instead of under congestion control (`/rate=RATE`,
+/// `crate::cc::FixedRate`), so the peer does the same for what it sends on the
+/// path. Payload: path ID varint, rate varint (bits per second). A proxy only
+/// honours it up to its `--max-path-rate`. "rmpf" in ASCII.
+pub const FRAME_PATH_RATE: u64 = 0x726d_7066;
 
 const STREAM_CONTROL: u64 = 0x00;
 const STREAM_PUSH: u64 = 0x01;
@@ -89,6 +96,19 @@ impl Control {
             .context("writing PATH_PRIORITY")
     }
 
+    /// Tell the peer to send on `path_id` at a fixed `rate` (bits per second).
+    pub async fn send_path_rate(&self, path_id: PathId, rate: u64) -> Result<()> {
+        let mut payload = Vec::new();
+        varint::encode(u64::from(crate::util::path_id_u32(path_id)), &mut payload);
+        varint::encode(rate, &mut payload);
+        self.0
+            .lock()
+            .await
+            .write_all(&frame(FRAME_PATH_RATE, &payload))
+            .await
+            .context("writing PATH_RATE")
+    }
+
     /// Ask the peer to rank the paths it sends on by loss.
     pub async fn send_path_ranking(&self) -> Result<()> {
         let mut payload = Vec::new();
@@ -125,15 +145,30 @@ pub async fn open_control(conn: &Connection) -> Result<Control> {
 }
 
 /// Service the peer's unidirectional streams until the connection closes:
-/// read its control stream (logging SETTINGS, applying path priorities), drain
-/// QPACK streams, and refuse push and unknown stream types.
-pub async fn serve_uni_streams(conn: Connection, priorities: Arc<PathPriorities>) {
+/// read its control stream (logging SETTINGS, applying path priorities and,
+/// up to `max_path_rate`, path rates), drain QPACK streams, and refuse push
+/// and unknown stream types.
+pub async fn serve_uni_streams(
+    conn: Connection,
+    priorities: Arc<PathPriorities>,
+    max_path_rate: Option<u64>,
+) {
     while let Ok(recv) = conn.accept_uni().await {
-        tokio::spawn(serve_uni_stream(conn.clone(), priorities.clone(), recv));
+        tokio::spawn(serve_uni_stream(
+            conn.clone(),
+            priorities.clone(),
+            max_path_rate,
+            recv,
+        ));
     }
 }
 
-async fn serve_uni_stream(conn: Connection, priorities: Arc<PathPriorities>, recv: RecvStream) {
+async fn serve_uni_stream(
+    conn: Connection,
+    priorities: Arc<PathPriorities>,
+    max_path_rate: Option<u64>,
+    recv: RecvStream,
+) {
     let mut reader = FrameReader::new(recv);
     let ty = match reader.read_varint().await {
         Ok(Some(ty)) => ty,
@@ -157,6 +192,9 @@ async fn serve_uni_stream(conn: Connection, priorities: Arc<PathPriorities>, rec
                 match reader.read_frame(MAX_HEADER_FRAME).await {
                     Ok(Some((FRAME_PATH_PRIORITY, payload))) => {
                         apply_path_priority(&conn, &priorities, &payload)
+                    }
+                    Ok(Some((FRAME_PATH_RATE, payload))) => {
+                        apply_path_rate(&conn, &priorities, max_path_rate, &payload)
                     }
                     Ok(Some((FRAME_PATH_RANKING, payload))) => {
                         if varint::decode(&payload).map(|(mode, _)| mode) == Some(PATH_RANKING_AUTO)
@@ -211,6 +249,44 @@ fn apply_path_priority(conn: &Connection, priorities: &PathPriorities, payload: 
     }
     log::debug!("path {path_id}: peer set priority {priority}");
     priorities.set_base(conn, path_id, priority);
+}
+
+fn parse_path_rate(payload: &[u8]) -> Option<(PathId, u64)> {
+    let (path_id, n) = varint::decode(payload)?;
+    let (rate, m) = varint::decode(&payload[n..])?;
+    if n + m != payload.len() || rate == 0 {
+        return None;
+    }
+    Some((PathId::from(u32::try_from(path_id).ok()?), rate))
+}
+
+fn apply_path_rate(
+    conn: &Connection,
+    priorities: &PathPriorities,
+    max_path_rate: Option<u64>,
+    payload: &[u8],
+) {
+    let Some((path_id, requested)) = parse_path_rate(payload) else {
+        log::debug!("ignoring malformed PATH_RATE frame");
+        return;
+    };
+    let requested_text = crate::cc::format_rate(requested);
+    let Some(max) = max_path_rate else {
+        log::info!(
+            "path {path_id}: peer asked for a fixed rate of {requested_text}bit/s; ignored \
+             (no --max-path-rate), the path stays congestion-controlled"
+        );
+        return;
+    };
+    let rate = requested.min(max);
+    if priorities.set_rate(conn, path_id, rate) {
+        log::info!(
+            "path {path_id}: fixed rate {}bit/s (peer asked for {requested_text}bit/s)",
+            crate::cc::format_rate(rate)
+        );
+    } else {
+        log::debug!("path {path_id}: rate for a closed path ignored");
+    }
 }
 
 fn parse_settings(mut payload: &[u8]) -> Option<Vec<(u64, u64)>> {
