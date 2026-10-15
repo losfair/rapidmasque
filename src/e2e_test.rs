@@ -6,6 +6,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -19,9 +20,13 @@ use crate::ech_test::{ech_config_list_and_key_set, self_signed};
 use crate::endpoint::Endpoint as ProxyEndpoint;
 use crate::h3;
 use crate::quic::{self, TransportOptions, Verify, WIREGUARD_1280_DATAGRAM};
+use crate::ranking::{self, PathPriorities, RankingConfig};
+use crate::routed_socket;
 use crate::rules::RuleTable;
 use crate::server::{self, ServerState};
+use crate::stats;
 use crate::tls::HandshakeData;
+use crate::util::canonical;
 
 /// The certificate from `ech_test::self_signed` covers this name.
 const HOST: &str = "secret.internal";
@@ -102,7 +107,8 @@ fn transport(congestion_control: CongestionControl) -> TransportOptions {
 }
 
 fn client_endpoint(dual_stack: bool) -> Endpoint {
-    let socket = quic::client_bind_socket("127.0.0.1:1".parse().unwrap(), dual_stack).unwrap();
+    let socket =
+        quic::client_bind_socket("127.0.0.1:1".parse().unwrap(), dual_stack, None).unwrap();
     Endpoint::new(
         quic::endpoint_config(),
         None,
@@ -265,7 +271,7 @@ async fn path_priorities_apply_on_both_ends() {
     tokio::spawn(async move {
         let conn = server.accept().await.unwrap().await.unwrap();
         let _control = h3::open_control(&conn).await.unwrap();
-        tokio::spawn(h3::serve_uni_streams(conn.clone()));
+        tokio::spawn(h3::serve_uni_streams(conn.clone(), Default::default()));
         let _ = server_tx.send(conn.clone());
         conn.closed().await;
     });
@@ -287,7 +293,12 @@ async fn path_priorities_apply_on_both_ends() {
         "primary path must be pinned to the handshake's source address"
     );
     for spec in [primary, extra] {
-        tokio::spawn(client::maintain_path(conn.clone(), spec, control.clone()));
+        tokio::spawn(client::maintain_path(
+            conn.clone(),
+            spec,
+            control.clone(),
+            Default::default(),
+        ));
     }
 
     // Path 0 (primary) gets priority 1 and the extra path priority 3, on both
@@ -312,6 +323,279 @@ async fn path_priorities_apply_on_both_ends() {
     );
 }
 
+/// A UDP relay standing in for an impaired network path between one client
+/// and `upstream`: it drops `loss_permille`/1000 of the packets in each
+/// direction (evenly spread, so the rate is exact).
+async fn lossy_relay(upstream: SocketAddr, loss_permille: Arc<AtomicU32>) -> SocketAddr {
+    let sock = UdpSocket::bind("127.0.0.3:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        let mut client = None;
+        let mut debt = [0u32; 2];
+        while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+            let (to, dir) = if from == upstream {
+                match client {
+                    Some(c) => (c, 0),
+                    None => continue,
+                }
+            } else {
+                client = Some(from);
+                (upstream, 1)
+            };
+            debt[dir] += loss_permille.load(Ordering::Relaxed);
+            if debt[dir] >= 1000 {
+                debt[dir] -= 1000;
+                continue;
+            }
+            let _ = sock.send_to(&buf[..n], to).await;
+        }
+    });
+    addr
+}
+
+/// The local priority of the path to `remote`, if open. On a dual-stack
+/// client socket noq reports IPv4 remotes in IPv4-mapped form.
+fn priority_towards(conn: &noq::Connection, remote: SocketAddr) -> Option<u8> {
+    (0..4 * quic::MAX_PATHS)
+        .filter_map(|id| conn.path(noq::PathId::from(id)))
+        .find(|p| p.remote_address().ok().map(canonical) == Some(canonical(remote)))
+        .and_then(|p| p.priority().ok())
+}
+
+/// `--path-ranking auto`: a path whose loss is clearly worse than another path
+/// of the same priority is demoted on both ends (each end ranking what it
+/// sends), and promoted again once the loss stops.
+#[tokio::test(flavor = "multi_thread")]
+async fn lossy_path_is_demoted_and_recovers_on_both_ends() {
+    // Fast sampling; idle paths (only keepalives, 1/s) still yield samples.
+    let config = RankingConfig {
+        interval: Duration::from_millis(100),
+        min_sample_packets: 30,
+        max_sample_age: Duration::from_millis(500),
+        min_idle_sample_packets: 2,
+        sample_weight: 1.0,
+        demote_after: 2,
+        promote_after: 2,
+        min_change_interval: Duration::from_millis(500),
+        ..Default::default()
+    };
+    let fx = Fixture::new("ranking");
+    let server = fx.server(HOST);
+    let server_addr = server.local_addr().unwrap();
+    let (server_tx, server_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let priorities = Arc::new(PathPriorities::default());
+        ranking::start(conn.clone(), priorities.clone(), config);
+        let _control = h3::open_control(&conn).await.unwrap();
+        tokio::spawn(h3::serve_uni_streams(conn.clone(), priorities));
+        let _ = server_tx.send(conn.clone());
+        while let Ok(d) = conn.read_datagram().await {
+            let _ = conn.send_datagram(d);
+        }
+    });
+
+    // The handshake path (path 0, preferred by noq at equal priority, so it
+    // carries the traffic) goes through the relay; the extra path is direct.
+    let loss = Arc::new(AtomicU32::new(0));
+    let relay = lossy_relay(server_addr, loss.clone()).await;
+    let client = client_endpoint(true);
+    let conn = client
+        .connect_with(fx.client_config(false), relay, HOST)
+        .unwrap()
+        .await
+        .unwrap();
+    let server_conn = server_rx.await.unwrap();
+    let control = h3::open_control(&conn).await.unwrap();
+    let priorities = Arc::new(PathPriorities::default());
+    control.send_path_ranking().await.unwrap();
+    ranking::start(conn.clone(), priorities.clone(), config);
+    let direct: PathSpec = server_addr.to_string().parse().unwrap();
+    let primary = client::primary_path_spec(&conn, relay, std::slice::from_ref(&direct), 0).await;
+    for spec in [primary, direct] {
+        tokio::spawn(client::maintain_path(
+            conn.clone(),
+            spec,
+            control.clone(),
+            priorities.clone(),
+        ));
+    }
+    tokio::spawn({
+        let conn = conn.clone();
+        async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(2));
+            loop {
+                tick.tick().await;
+                if conn
+                    .send_datagram(bytes::Bytes::from_static(&[7; 1000]))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    });
+    tokio::spawn({
+        let conn = conn.clone();
+        async move { while conn.read_datagram().await.is_ok() {} }
+    });
+
+    // The server sees the relayed path as coming from the relay itself.
+    let relayed = |c: &noq::Connection| priority_towards(c, relay);
+    let wait_for = |want: u8| {
+        let (conn, server_conn) = (conn.clone(), server_conn.clone());
+        async move {
+            for _ in 0..300 {
+                if relayed(&conn) == Some(want) && relayed(&server_conn) == Some(want) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            panic!(
+                "relayed path priority: client {:?}, server {:?}, want {want}",
+                relayed(&conn),
+                relayed(&server_conn)
+            );
+        }
+    };
+
+    // Let the extra path come up and both paths collect clean samples.
+    wait_for(0).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(priority_towards(&conn, server_addr), Some(0));
+
+    loss.store(200, Ordering::Relaxed);
+    wait_for(1).await; // 2 * base 0 + demoted
+    assert_eq!(
+        priority_towards(&conn, server_addr),
+        Some(0),
+        "the clean path must stay preferred"
+    );
+
+    loss.store(0, Ordering::Relaxed);
+    wait_for(0).await;
+}
+
+/// A path routed onto its own socket (`--path .../rtable=N` on OpenBSD; here a
+/// second socket in the default table) sends and receives through that
+/// socket: the server sees it from another source port than the primary.
+#[tokio::test(flavor = "multi_thread")]
+async fn routed_path_uses_its_own_socket() {
+    let fx = Fixture::new("routed");
+    let server = fx.server(HOST);
+    let server_addr = server.local_addr().unwrap();
+    let (server_tx, server_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let _ = server_tx.send(conn.clone());
+        while let Ok(d) = conn.read_datagram().await {
+            let _ = conn.send_datagram(d);
+        }
+    });
+
+    let extra_local: std::net::IpAddr = "127.0.0.2".parse().unwrap();
+    let socket = quic::client_bind_socket(server_addr, true, None).unwrap();
+    let routed = routed_socket::build(
+        socket,
+        &[routed_socket::Route {
+            remote: server_addr,
+            local_ip: Some(extra_local),
+            rtable: None,
+        }],
+    )
+    .unwrap();
+    let client = Endpoint::new_with_abstract_socket(
+        quic::endpoint_config(),
+        None,
+        routed,
+        Arc::new(TokioRuntime),
+    )
+    .unwrap();
+    let conn = client
+        .connect_with(fx.client_config(false), server_addr, HOST)
+        .unwrap()
+        .await
+        .unwrap();
+    let server_conn = server_rx.await.unwrap();
+
+    let tuple = FourTuple::new(server_addr, Some(extra_local));
+    let mut path = None;
+    for _ in 0..40 {
+        match conn.open_path_ensure(tuple, PathStatus::Available).await {
+            Ok(p) => {
+                path = Some(p);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    let path = path.expect("routed path must open");
+    conn.path(noq::PathId::ZERO)
+        .unwrap()
+        .set_status(PathStatus::Backup)
+        .unwrap();
+    conn.send_datagram(bytes::Bytes::from_static(b"routed"))
+        .unwrap();
+    let echoed = tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&echoed[..], b"routed");
+    assert!(
+        path.stats().udp_rx.datagrams > 0,
+        "replies arrive on the routed socket"
+    );
+
+    let remote_of = |id| {
+        server_conn
+            .path(id)
+            .and_then(|p| p.remote_address().ok())
+            .map(canonical)
+            .unwrap()
+    };
+    let (primary, routed) = (remote_of(noq::PathId::ZERO), remote_of(path.id()));
+    assert_eq!(routed.ip(), extra_local);
+    assert_ne!(
+        primary.port(),
+        routed.port(),
+        "the routed path must leave through its own socket"
+    );
+}
+
+/// `--bbr3-initial-window` reaches the connection's BBRv3 controllers.
+#[tokio::test(flavor = "multi_thread")]
+async fn bbr3_initial_window_applies_to_connections() {
+    const WINDOW: u64 = 256 * 1024;
+    let fx = Fixture::new("initcwnd");
+    let server = fx.server(HOST);
+    let addr = server.local_addr().unwrap();
+    tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        conn.closed().await;
+    });
+    let config = quic::build_client_config(
+        &Verify::Roots {
+            ca_file: Some(fx.cert.clone()),
+        },
+        None,
+        TransportOptions {
+            bbr3_initial_window: WINDOW,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let client = client_endpoint(false);
+    let conn = client
+        .connect_with(config, addr, HOST)
+        .unwrap()
+        .await
+        .unwrap();
+    // BBRv3 only grows the window from its initial value during startup.
+    let cwnd = conn.path(noq::PathId::ZERO).unwrap().stats().cwnd;
+    assert!(cwnd >= WINDOW, "cwnd {cwnd} below the configured {WINDOW}");
+}
+
 async fn udp_echo() -> SocketAddr {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = sock.local_addr().unwrap();
@@ -326,9 +610,21 @@ async fn udp_echo() -> SocketAddr {
     addr
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn tunnel_roundtrip_with_ech_and_multipath() {
-    let fx = Fixture::new("tunnel");
+/// A running server + local client proxy, tunnelling to a UDP echo target.
+struct Tunnel {
+    /// The client's local UDP listen address.
+    listen: SocketAddr,
+}
+
+/// Start a server (rule-pinned to a UDP echo target) and a client proxy with
+/// ECH and the extra paths `paths(proxy_addr)`, optionally listing their
+/// connections in stats registries.
+async fn start_tunnel(
+    fx: &Fixture,
+    paths: impl FnOnce(SocketAddr) -> Vec<PathSpec>,
+    server_stats: Option<Arc<stats::Registry>>,
+    client_stats: Option<Arc<stats::Registry>>,
+) -> Tunnel {
     let target = udp_echo().await;
 
     // Server: bind first to learn the port the rule's authority must carry.
@@ -358,10 +654,10 @@ async fn tunnel_roundtrip_with_ech_and_multipath() {
     .unwrap();
     let state = Arc::new(ServerState {
         rules: ArcSwap::from_pointee(rules),
+        stats: server_stats,
     });
     tokio::spawn(server::run(endpoint, state));
 
-    // Client: a local UDP proxy with ECH and an extra multipath path.
     let listen = {
         let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         s.local_addr().unwrap()
@@ -375,36 +671,133 @@ async fn tunnel_roundtrip_with_ech_and_multipath() {
                 ca_file: Some(fx.cert.clone()),
             },
             ech_config_list: Some(fx.ech_list.clone()),
-            paths: vec![
-                format!("{proxy_addr}@127.0.0.2")
-                    .parse::<PathSpec>()
-                    .unwrap(),
-            ],
+            paths: paths(proxy_addr),
             primary_priority: 0,
+            rtable: None,
+            path_ranking: Default::default(),
+            stats: client_stats,
             transport: transport(CongestionControl::None),
         },
         listen,
     };
     tokio::spawn(client::run_proxy(opts));
+    Tunnel { listen }
+}
 
-    let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let mut buf = vec![0u8; 2048];
-    for attempt in 0..50 {
-        app.send_to(format!("hello {attempt}").as_bytes(), listen)
-            .await
-            .unwrap();
-        if let Ok(Ok(n)) =
-            tokio::time::timeout(Duration::from_millis(200), app.recv(&mut buf)).await
-        {
-            let reply = std::str::from_utf8(&buf[..n]).unwrap();
-            assert!(
-                reply.starts_with("echo:hello "),
-                "unexpected reply {reply:?}"
-            );
+impl Tunnel {
+    /// Send datagrams through the tunnel until one is echoed back.
+    async fn roundtrip(&self) {
+        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        for attempt in 0..50 {
+            app.send_to(format!("hello {attempt}").as_bytes(), self.listen)
+                .await
+                .unwrap();
+            if let Ok(Ok(n)) =
+                tokio::time::timeout(Duration::from_millis(200), app.recv(&mut buf)).await
+            {
+                let reply = std::str::from_utf8(&buf[..n]).unwrap();
+                assert!(
+                    reply.starts_with("echo:hello "),
+                    "unexpected reply {reply:?}"
+                );
+                return;
+            }
+        }
+        panic!("no reply through the tunnel");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tunnel_roundtrip_with_ech_and_multipath() {
+    let fx = Fixture::new("tunnel");
+    // An extra multipath path from another loopback source address.
+    let tunnel = start_tunnel(
+        &fx,
+        |proxy| vec![format!("{proxy}@127.0.0.2").parse().unwrap()],
+        None,
+        None,
+    )
+    .await;
+    tunnel.roundtrip().await;
+}
+
+/// `GET` `path` from an HTTP server; returns the status code and body.
+async fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    sock.write_all(format!("GET {path} HTTP/1.1\r\nHost: stats\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut response = String::new();
+    sock.read_to_string(&mut response).await.unwrap();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+    (status, body.to_string())
+}
+
+/// The stats endpoint lists the tunnel's connection on both ends, with its
+/// paths, their priorities and the (default) automatic ranking.
+#[tokio::test(flavor = "multi_thread")]
+async fn stats_endpoint_reports_connections_and_paths() {
+    let fx = Fixture::new("stats");
+    let (server_stats, client_stats) = (
+        stats::Registry::new("server"),
+        stats::Registry::new("client"),
+    );
+    let mut endpoints = Vec::new();
+    for registry in [&server_stats, &client_stats] {
+        let listener = stats::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        endpoints.push(listener.local_addr().unwrap());
+        tokio::spawn(stats::serve(listener, registry.clone()));
+    }
+    let tunnel = start_tunnel(
+        &fx,
+        |proxy| vec![format!("{proxy}@127.0.0.2/priority=2").parse().unwrap()],
+        Some(server_stats),
+        Some(client_stats),
+    )
+    .await;
+    tunnel.roundtrip().await;
+
+    // Both ends report one connection with the primary path and the extra
+    // path at priority 2 (announced to the server), and one flow.
+    let mut last = Vec::new();
+    for _ in 0..50 {
+        last.clear();
+        for (addr, role) in endpoints.iter().zip(["server", "client"]) {
+            let (status, body) = http_get(*addr, "/stats").await;
+            assert_eq!(status, 200);
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["role"], role);
+            last.push(v);
+        }
+        let done = last.iter().all(|v| {
+            let Some([conn]) = v["connections"].as_array().map(Vec::as_slice) else {
+                return false;
+            };
+            let paths = conn["paths"].as_array().unwrap();
+            conn["flows"] == 1
+                && conn["multipath"] == true
+                // Ranking is on by default (the client asks the proxy too), so
+                // the effective noq priority is 2 * configured priority.
+                && conn["path_ranking"] == true
+                && paths
+                    .iter()
+                    .any(|p| p["priority"] == 0 && p["status"] == "available")
+                && paths
+                    .iter()
+                    .any(|p| p["priority"] == 4 && p["base_priority"] == 2 && p["rtt_ms"].is_f64())
+        });
+        if done {
+            assert_eq!(last[0]["connections"][0]["info"]["sni"], HOST);
+            assert_eq!(last[0]["connections"][0]["info"]["ech"], true);
+            assert_eq!(http_get(endpoints[0], "/nope").await.0, 404);
             return;
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("no reply through the tunnel");
+    panic!("unexpected stats: {last:#?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

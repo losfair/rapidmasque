@@ -125,6 +125,22 @@ pub(crate) fn enlarge_udp_buffers(sock: &impl std::os::fd::AsRawFd) {
 /// unspecified IPv6 address is bound dual-stack so multipath can mix IPv4 and
 /// IPv6 paths on one endpoint.
 pub(crate) fn bind_endpoint_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {
+    bind_endpoint_socket_in(addr, None)
+}
+
+/// [`bind_endpoint_socket`] in OpenBSD routing table `rtable` (`SO_RTABLE`,
+/// which must be set before binding), if given.
+pub(crate) fn bind_endpoint_socket_in(
+    addr: SocketAddr,
+    rtable: Option<u32>,
+) -> Result<std::net::UdpSocket> {
+    bind_socket(addr, rtable).map(|(sock, _)| sock)
+}
+
+/// Bind as [`bind_endpoint_socket_in`]; also returns whether the socket is
+/// dual-stack (an unspecified IPv6 address that also carries IPv4). Some
+/// systems, e.g. OpenBSD, have no dual-stack sockets.
+fn bind_socket(addr: SocketAddr, rtable: Option<u32>) -> Result<(std::net::UdpSocket, bool)> {
     use socket2::{Domain, Protocol, Socket, Type};
     let domain = if addr.is_ipv4() {
         Domain::IPV4
@@ -133,25 +149,29 @@ pub(crate) fn bind_endpoint_socket(addr: SocketAddr) -> Result<std::net::UdpSock
     };
     let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
         .with_context(|| format!("creating UDP socket for {addr}"))?;
-    if let SocketAddr::V6(v6) = addr
-        && v6.ip().is_unspecified()
-    {
-        let _ = sock.set_only_v6(false);
-    }
+    let dual_stack = matches!(addr, SocketAddr::V6(v6) if v6.ip().is_unspecified())
+        && sock.set_only_v6(false).is_ok()
+        && sock.only_v6().is_ok_and(|only| !only);
     enlarge_udp_buffers(&sock);
+    if let Some(rtable) = rtable {
+        set_rtable(&sock, rtable).with_context(|| format!("selecting routing table {rtable}"))?;
+    }
     sock.bind(&addr.into())
         .with_context(|| format!("binding UDP {addr}"))?;
-    Ok(sock.into())
+    Ok((sock.into(), dual_stack))
 }
 
 /// The unspecified address to bind a client endpoint on. With extra multipath
-/// paths configured this is dual-stack `[::]:0` (falling back to the primary
-/// family if IPv6 is unavailable).
+/// paths configured this is dual-stack `[::]:0`, falling back to the primary
+/// family where IPv6 or dual-stack sockets are unavailable (OpenBSD has none:
+/// an IPv6 socket there cannot reach IPv4 peers). `rtable` selects its OpenBSD
+/// routing table.
 pub(crate) fn client_bind_socket(
     primary: SocketAddr,
     dual_stack: bool,
+    rtable: Option<u32>,
 ) -> Result<std::net::UdpSocket> {
-    if dual_stack && let Ok(s) = bind_endpoint_socket((Ipv6Addr::UNSPECIFIED, 0).into()) {
+    if dual_stack && let Ok((s, true)) = bind_socket((Ipv6Addr::UNSPECIFIED, 0).into(), rtable) {
         return Ok(s);
     }
     let bind: SocketAddr = if primary.is_ipv4() {
@@ -159,7 +179,29 @@ pub(crate) fn client_bind_socket(
     } else {
         "[::]:0".parse().unwrap()
     };
-    bind_endpoint_socket(bind)
+    bind_endpoint_socket_in(bind, rtable)
+}
+
+/// Whether routing tables (`SO_RTABLE`) are supported here: OpenBSD only.
+pub(crate) const RTABLE_SUPPORTED: bool = cfg!(target_os = "openbsd");
+
+/// Put a socket in OpenBSD routing table `rtable` (rtable(4)). Must happen
+/// before `bind`. Unprivileged processes may select any existing table while
+/// their own is 0.
+#[cfg(target_os = "openbsd")]
+fn set_rtable(sock: &socket2::Socket, rtable: u32) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let rtable = libc::c_int::try_from(rtable)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    set_sockopt_int(sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RTABLE, rtable)
+}
+
+#[cfg(not(target_os = "openbsd"))]
+fn set_rtable(_sock: &socket2::Socket, _rtable: u32) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "routing tables (SO_RTABLE) are only supported on OpenBSD",
+    ))
 }
 
 /// Endpoint-level config: QUIC v1 only (the BoringSSL backend's version).
@@ -174,6 +216,8 @@ pub(crate) fn endpoint_config() -> EndpointConfig {
 pub struct TransportOptions {
     /// Outer congestion control for what this side sends.
     pub congestion_control: CongestionControl,
+    /// BBRv3 initial congestion window in bytes, per path.
+    pub bbr3_initial_window: u64,
     /// How long data may queue for a preferred (lower priority value) path
     /// before it spills onto less preferred paths. `None` spills as soon as
     /// the preferred path is held back by its pacer or congestion window.
@@ -184,10 +228,21 @@ impl Default for TransportOptions {
     fn default() -> Self {
         Self {
             congestion_control: CongestionControl::Bbr3,
+            bbr3_initial_window: DEFAULT_BBR3_INITIAL_WINDOW,
             path_spill_threshold: Some(DEFAULT_PATH_SPILL_THRESHOLD),
         }
     }
 }
+
+/// Default for `--bbr3-initial-window`: 64 KiB, ~48 full-size packets.
+///
+/// noq's default (RFC 9002's ~10 packets, 12000 bytes) is sized for short web
+/// connections competing with many others. A tunnel is one long-lived
+/// connection carrying aggregated, mostly unreliable traffic, often over high
+/// RTT: from 12 KB, BBRv3's startup needs ~6 round trips (~1.7 s at 270 ms) to
+/// fill a 20 Mbit/s path, and datagrams queue in noq meanwhile. Startup is
+/// paced, so a larger window does not leave in one burst.
+pub const DEFAULT_BBR3_INITIAL_WINDOW: u64 = 64 * 1024;
 
 /// Default for `--path-spill-threshold-ms`: the extra queueing delay accepted
 /// on a preferred path before traffic spills onto less preferred ones. Only
@@ -208,7 +263,7 @@ fn transport_config(keepalive: bool, opts: TransportOptions) -> Arc<TransportCon
     // non-congestive loss; with multipath, noq runs one instance per path.
     // `none` drops outer congestion control entirely, for payloads that are
     // already congestion-controlled end to end (see `crate::cc`).
-    t.congestion_controller_factory(opts.congestion_control.factory());
+    t.congestion_controller_factory(opts.congestion_control.factory(opts.bbr3_initial_window));
     // Multipath (draft-ietf-quic-multipath): both ends advertise support, so
     // the client may open extra paths (other local interfaces / server
     // addresses) and noq schedules datagrams across them.
@@ -438,7 +493,10 @@ pub(crate) async fn log_path_events(conn: noq::Connection) {
         match ev {
             None => return,
             Some(Ok(noq::PathEvent::Established { id: path, .. })) => {
-                let remote = conn.path(path).and_then(|p| p.remote_address().ok());
+                let remote = conn
+                    .path(path)
+                    .and_then(|p| p.remote_address().ok())
+                    .map(crate::util::canonical);
                 log::info!("connection {id}: path {path} established ({remote:?})");
             }
             Some(Ok(noq::PathEvent::Abandoned {
@@ -449,6 +507,40 @@ pub(crate) async fn log_path_events(conn: noq::Connection) {
             Some(Ok(other)) => log::debug!("connection {id}: {other:?}"),
             Some(Err(e)) => log::debug!("connection {id}: path events lagged: {e}"),
         }
+    }
+}
+
+/// Finds a connection's live multipath paths. noq has no path list API, but
+/// path IDs are assigned in order and never reused, so the live paths are the
+/// ones found before plus possibly a few above the highest seen. Scan often
+/// enough (about once a second) that fewer than `2 * MAX_PATHS` paths open in
+/// between.
+#[derive(Debug, Default)]
+pub(crate) struct PathScan {
+    known: std::collections::BTreeSet<u32>,
+    next_id: u32,
+}
+
+impl PathScan {
+    /// The paths that are currently open (or abandoned but not yet discarded),
+    /// in path ID order.
+    pub(crate) fn scan(&mut self, conn: &noq::Connection) -> Vec<noq::Path> {
+        let candidates: std::collections::BTreeSet<u32> = self
+            .known
+            .iter()
+            .copied()
+            .chain(self.next_id..self.next_id + 2 * MAX_PATHS)
+            .collect();
+        let mut paths = Vec::new();
+        self.known.clear();
+        for id in candidates {
+            if let Some(path) = conn.path(noq::PathId::from(id)) {
+                self.known.insert(id);
+                self.next_id = self.next_id.max(id + 1);
+                paths.push(path);
+            }
+        }
+        paths
     }
 }
 

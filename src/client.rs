@@ -13,6 +13,7 @@ use std::fmt;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -25,6 +26,9 @@ use crate::dgram;
 use crate::endpoint::Endpoint as ProxyEndpoint;
 use crate::h3::{self, FrameReader};
 use crate::quic::{self, CAPSULE_PROTOCOL_TRUE, TransportOptions, Verify, send_datagram};
+use crate::ranking::{self, PathPriorities, PathRanking, RankingConfig};
+use crate::routed_socket;
+use crate::stats;
 use crate::tls::HandshakeData;
 use crate::util::{CHANNEL_CAP, RECV_BUF, hex};
 
@@ -46,7 +50,8 @@ const PATH_WARN_AFTER: u32 = 3;
 /// learn its source address (see [`primary_path_spec`]).
 const PRIMARY_LOCAL_IP_WAIT: Duration = Duration::from_secs(5);
 
-/// An extra multipath path: `REMOTE_IP:PORT[@LOCAL_IP][/backup][/priority=N]`.
+/// An extra multipath path:
+/// `REMOTE_IP:PORT[@LOCAL_IP][/backup][/priority=N][/rtable=N]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathSpec {
     pub remote: SocketAddr,
@@ -54,6 +59,8 @@ pub struct PathSpec {
     pub backup: bool,
     /// Scheduling priority, lower is preferred (noq `Path::set_priority`).
     pub priority: u8,
+    /// OpenBSD routing table to send this path's packets through.
+    pub rtable: Option<u32>,
 }
 
 impl FromStr for PathSpec {
@@ -64,6 +71,7 @@ impl FromStr for PathSpec {
         let s = options.next().unwrap_or_default();
         let mut backup = false;
         let mut priority = 0;
+        let mut rtable = None;
         for option in options {
             if option == "backup" {
                 backup = true;
@@ -71,9 +79,14 @@ impl FromStr for PathSpec {
                 priority = n
                     .parse()
                     .map_err(|e| format!("bad priority {n:?} (0-255): {e}"))?;
+            } else if let Some(n) = option.strip_prefix("rtable=") {
+                rtable = Some(
+                    n.parse()
+                        .map_err(|e| format!("bad routing table {n:?}: {e}"))?,
+                );
             } else {
                 return Err(format!(
-                    "unknown path option {option:?} (expected backup or priority=N)"
+                    "unknown path option {option:?} (expected backup, priority=N or rtable=N)"
                 ));
             }
         }
@@ -93,6 +106,7 @@ impl FromStr for PathSpec {
             local_ip,
             backup,
             priority,
+            rtable,
         })
     }
 }
@@ -108,6 +122,9 @@ impl fmt::Display for PathSpec {
         }
         if self.priority != 0 {
             write!(f, "/priority={}", self.priority)?;
+        }
+        if let Some(rtable) = self.rtable {
+            write!(f, "/rtable={rtable}")?;
         }
         Ok(())
     }
@@ -125,6 +142,13 @@ pub struct ConnectParams {
     pub paths: Vec<PathSpec>,
     /// Scheduling priority of the primary path (only used with `paths`).
     pub primary_priority: u8,
+    /// OpenBSD routing table of the client's main socket: the primary path
+    /// and every path without its own `rtable`.
+    pub rtable: Option<u32>,
+    /// Rank paths by measured loss, on both ends (only used with `paths`).
+    pub path_ranking: PathRanking,
+    /// Connections listed on the stats endpoint, if enabled.
+    pub stats: Option<Arc<stats::Registry>>,
     pub transport: TransportOptions,
 }
 
@@ -197,14 +221,35 @@ async fn dial(p: &ConnectParams) -> Result<Dialed> {
     };
     let server_name = host_of(&p.endpoint.authority);
 
-    let socket = quic::client_bind_socket(proxy_addr, !p.paths.is_empty())
+    validate_routing_tables(&p.paths, proxy_addr)?;
+    let socket = quic::client_bind_socket(proxy_addr, !p.paths.is_empty(), p.rtable)
         .context("binding client UDP socket")?;
-    let endpoint = Endpoint::new(
-        quic::endpoint_config(),
-        None,
-        socket,
-        Arc::new(TokioRuntime),
-    )
+    let routes: Vec<routed_socket::Route> = p
+        .paths
+        .iter()
+        .filter_map(|spec| {
+            Some(routed_socket::Route {
+                remote: spec.remote,
+                local_ip: spec.local_ip,
+                rtable: Some(spec.rtable?),
+            })
+        })
+        .collect();
+    let endpoint = if routes.is_empty() {
+        Endpoint::new(
+            quic::endpoint_config(),
+            None,
+            socket,
+            Arc::new(TokioRuntime),
+        )
+    } else {
+        Endpoint::new_with_abstract_socket(
+            quic::endpoint_config(),
+            None,
+            routed_socket::build(socket, &routes).context("binding routing-table sockets")?,
+            Arc::new(TokioRuntime),
+        )
+    }
     .context("creating QUIC endpoint")?;
 
     log::info!("connecting to proxy {proxy_addr} (sni={server_name})");
@@ -294,21 +339,34 @@ async fn run_session(
             return false;
         }
     };
-    tokio::spawn(h3::serve_uni_streams(conn.clone()));
+    let priorities = Arc::new(PathPriorities::default());
+    tokio::spawn(h3::serve_uni_streams(conn.clone(), priorities.clone()));
     tokio::spawn(quic::log_path_events(conn.clone()));
+    if !p.paths.is_empty() && p.path_ranking == PathRanking::Auto && conn.is_multipath_enabled() {
+        // Rank what we send, and ask the proxy to rank what it sends.
+        if let Err(e) = control.send_path_ranking().await {
+            log::warn!("requesting path ranking from the proxy failed: {e:#}");
+        }
+        ranking::start(conn.clone(), priorities.clone(), RankingConfig::default());
+    }
     if !p.paths.is_empty() {
         // Also keep the primary path: if it is abandoned (e.g. its uplink went
         // away) while extra paths carry the tunnel, re-open it once it works.
         tokio::spawn({
-            let (conn, control) = (conn.clone(), control.clone());
+            let (conn, control, priorities) = (conn.clone(), control.clone(), priorities.clone());
             let (paths, priority) = (p.paths.clone(), p.primary_priority);
             async move {
                 let primary = primary_path_spec(&conn, proxy_addr, &paths, priority).await;
-                maintain_path(conn, primary, control).await
+                maintain_path(conn, primary, control, priorities).await
             }
         });
         for spec in p.paths.iter().cloned() {
-            tokio::spawn(maintain_path(conn.clone(), spec, control.clone()));
+            tokio::spawn(maintain_path(
+                conn.clone(),
+                spec,
+                control.clone(),
+                priorities.clone(),
+            ));
         }
     }
     log::info!(
@@ -322,8 +380,23 @@ async fn run_session(
     let mut by_addr: HashMap<SocketAddr, FlowState> = HashMap::new();
     let mut flows: HashMap<u64, SocketAddr> = HashMap::new();
     let mut next_token = 0u64;
+    let flow_count = Arc::new(AtomicUsize::new(0));
+    let _stats = p.stats.as_ref().map(|registry| {
+        let flow_count = flow_count.clone();
+        registry.register(
+            &conn,
+            priorities.clone(),
+            serde_json::json!({
+                "endpoint": p.endpoint.authority,
+                "proxy_addr": proxy_addr.to_string(),
+                "ech": ech,
+            }),
+            move || flow_count.load(Ordering::Relaxed),
+        )
+    });
 
     let reason = loop {
+        flow_count.store(by_addr.len(), Ordering::Relaxed);
         tokio::select! {
             local = lrx.recv() => {
                 let Some(first) = local else { break "local socket closed".to_string() };
@@ -489,6 +562,35 @@ async fn route_tunnel_datagram(lsock: &UdpSocket, flows: &HashMap<u64, SocketAdd
     }
 }
 
+/// Paths with their own routing table are told apart from other paths by
+/// their remote address and source address (all noq's datagrams carry), so
+/// those must be unique: one with a source address must not share both with
+/// another path, and one without must not share its remote with any other
+/// path, including the primary (`proxy_addr`, no source address).
+pub(crate) fn validate_routing_tables(paths: &[PathSpec], proxy_addr: SocketAddr) -> Result<()> {
+    for (i, spec) in paths.iter().enumerate() {
+        if spec.rtable.is_none() {
+            continue;
+        }
+        let others = paths
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, other)| (other.remote, other.local_ip))
+            .chain(std::iter::once((proxy_addr, None)));
+        for (remote, local_ip) in others {
+            if remote == spec.remote && (spec.local_ip.is_none() || local_ip == spec.local_ip) {
+                anyhow::bail!(
+                    "path {spec}: a path with its own routing table needs a remote address, or \
+                     remote and @LOCAL_IP, that no other path (including the primary, \
+                     {proxy_addr}) uses"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The spec that keeps the primary path (the handshake path to `proxy_addr`)
 /// open.
 ///
@@ -534,6 +636,7 @@ pub(crate) async fn primary_path_spec(
         local_ip,
         backup: false,
         priority,
+        rtable: None,
     }
 }
 
@@ -541,7 +644,12 @@ pub(crate) async fn primary_path_spec(
 /// re-opening it whenever it fails or is abandoned. Each time the path comes
 /// up (a re-opened path gets a new ID), its priority is set locally and sent
 /// to the proxy, which applies it to its side of the path.
-pub(crate) async fn maintain_path(conn: Connection, spec: PathSpec, control: h3::Control) {
+pub(crate) async fn maintain_path(
+    conn: Connection,
+    spec: PathSpec,
+    control: h3::Control,
+    priorities: Arc<PathPriorities>,
+) {
     if !conn.is_multipath_enabled() {
         log::warn!("proxy did not negotiate QUIC multipath; not opening path {spec}");
         return;
@@ -564,9 +672,7 @@ pub(crate) async fn maintain_path(conn: Connection, spec: PathSpec, control: h3:
                 if up != Some(path.id()) {
                     log::info!("multipath path {spec} up (path id {})", path.id());
                     up = Some(path.id());
-                    if let Err(e) = path.set_priority(spec.priority) {
-                        log::debug!("multipath path {spec}: setting priority: {e}");
-                    }
+                    priorities.set_base(&conn, path.id(), spec.priority);
                     if let Err(e) = control.send_path_priority(path.id(), spec.priority).await {
                         log::debug!("multipath path {spec}: announcing priority: {e:#}");
                     }
@@ -626,6 +732,51 @@ mod tests {
     }
 
     #[test]
+    fn routing_table_paths_must_be_distinguishable() {
+        let proxy: SocketAddr = "192.0.2.1:4433".parse().unwrap();
+        let specs =
+            |s: &[&str]| -> Vec<PathSpec> { s.iter().map(|s| s.parse().unwrap()).collect() };
+        // Distinct source address, or distinct remote: fine.
+        assert!(
+            validate_routing_tables(&specs(&["192.0.2.1:4433@10.0.0.5/rtable=1"]), proxy).is_ok()
+        );
+        assert!(validate_routing_tables(&specs(&["192.0.2.2:4433/rtable=1"]), proxy).is_ok());
+        assert!(
+            validate_routing_tables(
+                &specs(&[
+                    "192.0.2.2:4433@10.0.0.5/rtable=1",
+                    "192.0.2.2:4433@10.0.0.6"
+                ]),
+                proxy
+            )
+            .is_ok()
+        );
+        // Same remote as the primary without a source address.
+        assert!(validate_routing_tables(&specs(&["192.0.2.1:4433/rtable=1"]), proxy).is_err());
+        // Same remote and source as another path.
+        assert!(
+            validate_routing_tables(
+                &specs(&[
+                    "192.0.2.2:4433@10.0.0.5/rtable=1",
+                    "192.0.2.2:4433@10.0.0.5"
+                ]),
+                proxy
+            )
+            .is_err()
+        );
+        // No source address but another path to the same remote.
+        assert!(
+            validate_routing_tables(
+                &specs(&["192.0.2.2:4433/rtable=1", "192.0.2.2:4433@10.0.0.6"]),
+                proxy
+            )
+            .is_err()
+        );
+        // Paths without a routing table are not constrained.
+        assert!(validate_routing_tables(&specs(&["192.0.2.1:4433"]), proxy).is_ok());
+    }
+
+    #[test]
     fn path_spec_parsing() {
         let p: PathSpec = "192.0.2.1:4433".parse().unwrap();
         assert_eq!(p.remote, "192.0.2.1:4433".parse().unwrap());
@@ -649,6 +800,14 @@ mod tests {
         assert!("192.0.2.1:4433/priority=256".parse::<PathSpec>().is_err());
         assert!("192.0.2.1:4433/priority=".parse::<PathSpec>().is_err());
         assert!("192.0.2.1:4433/fast".parse::<PathSpec>().is_err());
+
+        let p: PathSpec = "192.0.2.1:4433@10.0.0.5/rtable=3/priority=1"
+            .parse()
+            .unwrap();
+        assert_eq!(p.rtable, Some(3));
+        assert_eq!(p.to_string(), "192.0.2.1:4433@10.0.0.5/priority=1/rtable=3");
+        assert_eq!(p.to_string().parse::<PathSpec>().unwrap(), p);
+        assert!("192.0.2.1:4433/rtable=-1".parse::<PathSpec>().is_err());
 
         let p: PathSpec = "[2001:db8::1]:443@[fe80::1]".parse().unwrap();
         assert_eq!(p.remote, "[2001:db8::1]:443".parse().unwrap());

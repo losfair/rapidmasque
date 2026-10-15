@@ -158,6 +158,14 @@ BBRv3 is model-based, tolerates non-congestive loss and paces, which suits a
 tunnel over a high-RTT, sporadically lossy path far better than a loss-based
 controller like CUBIC.
 
+Each new path starts BBRv3 with a 64 KiB congestion window
+(`--bbr3-initial-window BYTES`, on `serve` and `client`), not noq's default
+12 KB (RFC 9002's ~10 packets): the tunnel is one long-lived connection
+carrying aggregated, mostly unreliable traffic, often over high RTT, and from
+12 KB BBRv3's startup needs about 6 round trips (~1.7 s at 270 ms) to fill a
+20 Mbit/s path while datagrams queue. Startup is paced, so the larger window
+is not sent as one burst; lower it for slow, shallow-buffered links.
+
 When the tunnelled traffic already runs its own congestion control end to end
 (e.g. TCP inside WireGuard inside the tunnel), an outer controller on top
 ("double CC") can fight it: the outer window queues and delays datagrams,
@@ -189,7 +197,7 @@ rapidmasque client \
   --path '203.0.113.8:4433@10.64.0.5/backup'
 ```
 
-A path spec is `REMOTE_IP:PORT[@LOCAL_IP][/backup][/priority=N]`:
+A path spec is `REMOTE_IP:PORT[@LOCAL_IP][/backup][/priority=N][/rtable=N]`:
 
 - `REMOTE_IP:PORT` - a proxy address. It may differ from the primary one (the
   proxy's IPv6 address, another address of the same host, ...); the server must
@@ -202,6 +210,8 @@ A path spec is `REMOTE_IP:PORT[@LOCAL_IP][/backup][/priority=N]`:
 - `/priority=N` - scheduling priority, 0-255, lower is preferred (default 0).
   See [Path priority](#path-priority). The primary path's priority is
   `--primary-priority` (default 0).
+- `/rtable=N` - OpenBSD only: send the path through routing table `N`
+  (rtable(4)). See [Routing tables](#routing-tables-openbsd).
 
 The primary path (`--proxy-addr`, or the resolved endpoint host) is the
 handshake path, path 0 (path IDs are never reused: a re-opened path gets a new
@@ -255,10 +265,98 @@ hold-back off. Each side's flag governs what it sends. Paths with equal
 priority always share traffic, and `/backup` paths still only carry traffic
 when no non-backup path is usable.
 
+#### Automatic path ranking
+
+The client ranks paths by measured loss by default (`--path-ranking auto`;
+`--path-ranking off` keeps the configured priorities as they are), for paths
+whose quality varies (e.g. two cellular uplinks). Within each group of paths with the
+same configured priority, a path whose loss is clearly worse than the group's
+best is **demoted**: it falls behind the rest of its group (but never behind a
+path with a worse configured priority), so traffic moves to the better paths.
+It is **promoted** again once its loss recovers.
+
+- Loss is sampled from what each end *sends*, so the client ranks the upload
+  direction and asks the proxy (a rapidmasque extension frame on the HTTP/3
+  control stream) to rank the download direction on its own measurements.
+- A path is demoted when its loss is at least 5% and 3 points above the best
+  path of its group, in 3 consecutive samples (a sample is ~40 packets, or the
+  packets sent within 30 s on a quiet path), and in the smoothed loss rate.
+  The best path of a group is never demoted, so paths that are all equally
+  lossy keep sharing traffic. The 5% floor stays clear of the ~2% loss BBRv3
+  causes itself while probing for bandwidth.
+- A demoted path is PINGed every 100 ms (about 400 bytes/s) so its loss keeps
+  being measured; it is promoted after 3 samples at no more than half those
+  levels, typically within 15-30 s of the loss stopping. A path changes rank
+  at most every 10 s.
+- RTT is not used: smoothed RTT includes the queueing delay of whatever
+  traffic a path carries, so ranking on it would chase traffic back and forth.
+- With ranking on (the default), path priorities must be at most 127 (a
+  demoted path's noq priority is `2 * priority + 1`); use
+  `--path-ranking off` for higher ones.
+
+Rank changes are logged on each end.
+
+#### Routing tables (OpenBSD)
+
+On OpenBSD each path can use its own routing table, e.g. to send it out a
+second uplink whose default route lives in table 1:
+
+```
+route -T 1 add default 10.64.0.1
+rapidmasque client ... --proxy-addr 203.0.113.7:4433 \
+  --path '203.0.113.7:4433@10.64.0.5/rtable=1'
+```
+
+`--rtable N` sets the table of the primary path and of every path without its
+own `/rtable` (by default, the process's table; see `route -T N exec`). The
+client binds one extra UDP socket per routing table in use (`SO_RTABLE`) and
+sends each path's packets through its table's socket; its replies come back to
+that socket. noq's packets carry only their destination and source address,
+so a path with `/rtable` needs a remote address, or a remote address plus
+`@LOCAL_IP`, that no other path (including the primary) uses. An unprivileged
+process may select any existing table while its own table is 0. Elsewhere,
+`--rtable` and `/rtable=` are rejected at startup.
+
 With extra paths configured, the client binds a dual-stack `[::]:0` socket so
-IPv4 and IPv6 paths can share the connection. If the proxy does not negotiate
+IPv4 and IPv6 paths can share the connection (on systems without dual-stack
+sockets, such as OpenBSD, a socket of the primary path's family instead). If the proxy does not negotiate
 multipath (e.g. masque-go), extra paths are skipped with a warning and the
 tunnel runs single-path.
+
+### Stats endpoint
+
+`--stats-listen IP:PORT` (on `serve` and `client`, off by default) serves a
+JSON snapshot at `http://IP:PORT/stats`:
+
+```
+$ curl -s http://127.0.0.1:9100/stats
+{
+  "role": "client", "version": "0.1.0", "uptime_secs": 3600,
+  "connections": [{
+    "id": 140507909560848, "uptime_secs": 3590, "multipath": true,
+    "path_ranking": true, "flows": 3,
+    "info": { "endpoint": "proxy.example:4433", "proxy_addr": "203.0.113.7:4433", "ech": true },
+    "sent_packets": 1043211, "lost_packets": 2210,
+    "udp_tx": { "datagrams": 1040022, "bytes": 1380412218 }, "udp_rx": { ... },
+    "paths": [{
+      "id": 0, "remote": "203.0.113.7:4433", "local_ip": "192.168.1.20",
+      "status": "available", "priority": 0, "base_priority": 0,
+      "demoted": false, "ranked_loss": 0.001,
+      "rtt_ms": 23.4, "cwnd": 412000, "mtu": 1452,
+      "sent_packets": 900211, "lost_packets": 900, "sent_bytes": ..., "lost_bytes": ...,
+      "congestion_events": 12, "udp_tx": { ... }, "udp_rx": { ... }
+    }, ...]
+  }]
+}
+```
+
+Each live QUIC connection lists its multipath paths (open, or abandoned but
+not yet discarded) with their effective noq `priority`, the configured
+`base_priority`, the automatic ranking state (`demoted`, and `ranked_loss`, the
+smoothed loss rate of what this end sends, once sampled) and noq's per-path
+counters. On the server, `info` carries the client's handshake address, SNI
+and ECH status. The endpoint is plain HTTP without authentication and
+reveals peer addresses: bind it to loopback or a management network.
 
 ### Hot reload
 
@@ -383,7 +481,12 @@ multipath case (two extra paths via 127.0.0.2 / 127.0.0.3).
   and per flow.
 - `src/client.rs` - the local UDP→CONNECT-UDP proxy client and multipath path
   maintenance.
+- `src/ranking.rs` - per-connection path priorities and automatic path
+  ranking by loss (`--path-ranking`, on by default).
+- `src/routed_socket.rs` - the client's multi-socket noq socket for per-path
+  OpenBSD routing tables (`/rtable=N`).
 - `src/rules.rs` - the JSON endpoint→target rule table.
+- `src/stats.rs` - the optional HTTP stats endpoint (`--stats-listen`).
 - `src/quic.rs` - noq transport config (multipath, idle/keepalive) + BoringSSL
   context setup, ECH install hooks.
 - `src/cc.rs` - congestion control choice: BBRv3 (default) or the no-op

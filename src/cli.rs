@@ -7,6 +7,11 @@ use crate::cc::CongestionControl;
 use crate::client::PathSpec;
 use crate::quic::DEFAULT_PATH_SPILL_THRESHOLD;
 
+/// Smallest `--bbr3-initial-window`: two QUIC minimum-size (1200-byte)
+/// packets.
+const MIN_BBR3_INITIAL_WINDOW: u64 = 2 * 1200;
+use crate::ranking::PathRanking;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Multipath MASQUE (CONNECT-UDP) proxy and client", long_about = None)]
 pub struct Cli {
@@ -57,6 +62,15 @@ pub struct ServeArgs {
     #[arg(long, value_enum, default_value_t = CongestionControl::Bbr3)]
     pub congestion_control: CongestionControl,
 
+    /// BBRv3 initial congestion window in bytes, for every path this side
+    /// sends on [default: 65536, ~48 full-size packets; noq's own is 12000].
+    /// A larger window lets a new path ramp up faster on a high
+    /// bandwidth-delay path (BBRv3 paces it out rather than bursting), at
+    /// the cost of overshooting slow low-RTT links at path start. At least
+    /// 2400. Only with `--congestion-control bbr3`.
+    #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(MIN_BBR3_INITIAL_WINDOW..))]
+    pub bbr3_initial_window: Option<u64>,
+
     /// Queueing delay (milliseconds) accepted on a preferred path before
     /// traffic spills onto less preferred ones (paths with a higher
     /// `/priority=N`). While the preferred path can send everything queued
@@ -66,6 +80,13 @@ pub struct ServeArgs {
     /// all paths share one priority.
     #[arg(long, value_name = "MS", default_value_t = DEFAULT_PATH_SPILL_THRESHOLD.as_millis() as u64)]
     pub path_spill_threshold_ms: u64,
+
+    /// Serve a JSON stats snapshot (connections, multipath paths, priorities,
+    /// ranking, RTT, loss, traffic) over plain HTTP at `http://ADDR/stats`.
+    /// Off by default. No TLS or authentication and it reveals peer
+    /// addresses: bind it to loopback or a management network.
+    #[arg(long, value_name = "IP:PORT")]
+    pub stats_listen: Option<SocketAddr>,
 }
 
 #[derive(Parser, Debug)]
@@ -89,15 +110,17 @@ pub struct ClientArgs {
     pub proxy_addr: Option<SocketAddr>,
 
     /// Open an additional QUIC multipath path, as
-    /// `REMOTE_IP:PORT[@LOCAL_IP][/backup][/priority=N]`. `REMOTE` is a proxy
+    /// `REMOTE_IP:PORT[@LOCAL_IP][/backup][/priority=N][/rtable=N]`. `REMOTE` is a proxy
     /// address (it may differ from the primary one), `LOCAL_IP` pins the
     /// path's source address (e.g. a second uplink's address), and `/backup`
     /// makes it a standby path used only when no primary path works.
     /// `/priority=N` (0-255, default 0, lower is preferred) orders usable
     /// paths in both directions: traffic fills the preferred path first and
     /// spills onto the next ones (see `--path-spill-threshold-ms`); equal
-    /// priorities share traffic. Repeatable. Paths that fail are retried while
-    /// the tunnel is up.
+    /// priorities share traffic. `/rtable=N` (OpenBSD) sends the path through
+    /// routing table N (rtable(4)); such a path needs a remote, or remote and
+    /// `@LOCAL_IP`, that no other path uses. Repeatable. Paths that fail are
+    /// retried while the tunnel is up.
     #[arg(long = "path", value_name = "SPEC")]
     pub paths: Vec<PathSpec>,
 
@@ -105,6 +128,23 @@ pub struct ClientArgs {
     /// terms as `--path .../priority=N`. Only meaningful with `--path`.
     #[arg(long, value_name = "N", default_value_t = 0)]
     pub primary_priority: u8,
+
+    /// OpenBSD routing table (rtable(4)) for the primary path and every
+    /// `--path` without its own `/rtable=N`. Defaults to the process's table
+    /// (see `route -T N exec`).
+    #[arg(long, value_name = "N")]
+    pub rtable: Option<u32>,
+
+    /// Rank paths by measured loss: `auto` (default) demotes a path whose
+    /// loss is clearly worse than the best path with the same priority (at
+    /// least 5%, and 3 points above the best, for 3 samples in a row), so
+    /// traffic moves to the better paths of that priority; it is promoted
+    /// again once its loss recovers. The proxy does the same for what it
+    /// sends. Paths never move across configured priorities, which must then
+    /// be at most 127. `off` keeps the configured priorities as they are.
+    /// Only meaningful with `--path`.
+    #[arg(long, value_enum, default_value_t = PathRanking::Auto)]
+    pub path_ranking: PathRanking,
 
     /// Skip TLS certificate verification (testing only).
     #[arg(long)]
@@ -130,6 +170,15 @@ pub struct ClientArgs {
     #[arg(long, value_enum, default_value_t = CongestionControl::Bbr3)]
     pub congestion_control: CongestionControl,
 
+    /// BBRv3 initial congestion window in bytes, for every path this side
+    /// sends on [default: 65536, ~48 full-size packets; noq's own is 12000].
+    /// A larger window lets a new path ramp up faster on a high
+    /// bandwidth-delay path (BBRv3 paces it out rather than bursting), at
+    /// the cost of overshooting slow low-RTT links at path start. At least
+    /// 2400. Only with `--congestion-control bbr3`.
+    #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(MIN_BBR3_INITIAL_WINDOW..))]
+    pub bbr3_initial_window: Option<u64>,
+
     /// Queueing delay (milliseconds) accepted on a preferred path before
     /// traffic spills onto less preferred ones (paths with a higher
     /// `/priority=N`). While the preferred path can send everything queued
@@ -139,6 +188,13 @@ pub struct ClientArgs {
     /// all paths share one priority.
     #[arg(long, value_name = "MS", default_value_t = DEFAULT_PATH_SPILL_THRESHOLD.as_millis() as u64)]
     pub path_spill_threshold_ms: u64,
+
+    /// Serve a JSON stats snapshot (connections, multipath paths, priorities,
+    /// ranking, RTT, loss, traffic) over plain HTTP at `http://ADDR/stats`.
+    /// Off by default. No TLS or authentication and it reveals peer
+    /// addresses: bind it to loopback or a management network.
+    #[arg(long, value_name = "IP:PORT")]
+    pub stats_listen: Option<SocketAddr>,
 }
 
 #[derive(Parser, Debug)]
@@ -148,4 +204,50 @@ pub struct GenEchArgs {
     /// fallback; on ECH acceptance only the inner SNI is authenticated.
     #[arg(long, value_name = "NAME")]
     pub public_name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_defaults() {
+        let cli = Cli::try_parse_from([
+            "rapidmasque",
+            "client",
+            "--endpoint",
+            "https://proxy.example/connect",
+            "--listen",
+            "127.0.0.1:5353",
+        ])
+        .unwrap();
+        let Command::Client(args) = cli.command else {
+            panic!("expected the client subcommand");
+        };
+        assert_eq!(args.path_ranking, PathRanking::Auto);
+        assert_eq!(args.congestion_control, CongestionControl::Bbr3);
+        assert_eq!(args.path_spill_threshold_ms, 10);
+        assert_eq!(args.rtable, None);
+        assert_eq!(args.bbr3_initial_window, None);
+        let parse = |window: &str| {
+            Cli::try_parse_from([
+                "rapidmasque",
+                "serve",
+                "--rules",
+                "r.json",
+                "--cert",
+                "c.pem",
+                "--key",
+                "k.pem",
+                "--bbr3-initial-window",
+                window,
+            ])
+        };
+        let Command::Serve(args) = parse("65536").unwrap().command else {
+            panic!("expected the serve subcommand");
+        };
+        assert_eq!(args.bbr3_initial_window, Some(65536));
+        assert!(parse("1200").is_err());
+        assert_eq!(args.stats_listen, None);
+    }
 }
