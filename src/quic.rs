@@ -29,8 +29,9 @@ pub(crate) const CAPSULE_PROTOCOL_TRUE: &str = "?1";
 /// Connection (and per-path) idle timeout: a dead path or peer is detected
 /// within this long.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Client keepalive cadence; keeps NAT mappings warm on every path and lets a
-/// dead path be detected quickly.
+/// Keepalive cadence. The client pings the connection and every path; the
+/// server pings every path too (see `transport_config`). Keeps NAT mappings
+/// warm and lets a dead path be detected quickly.
 const KEEPALIVE: Duration = Duration::from_secs(1);
 /// Upper bound on concurrently open multipath paths, per connection.
 pub(crate) const MAX_PATHS: u32 = 8;
@@ -39,6 +40,22 @@ pub(crate) const MAX_PATHS: u32 = 8;
 /// contract).
 const DGRAM_SEND_BUFFER: usize = 4 * 1024 * 1024;
 const DGRAM_RECV_BUFFER: usize = 8 * 1024 * 1024;
+
+/// Initial and minimum outer (client<->proxy) QUIC packet size, i.e. UDP
+/// payload bytes.
+/// Sized so a full 1280-MTU inner datagram survives the trip from the very
+/// first packet: a 1280-byte IPv6 packet inside WireGuard is a 1312-byte UDP
+/// payload (16B header + 16B tag), plus our 2B HTTP-datagram prefix = 1314B
+/// that must fit in one QUIC DATAGRAM frame (which cannot be fragmented).
+/// noq's default of 1200 leaves only ~1162B, so until DPLPMTUD has probed the
+/// path upward (and indefinitely where probing never succeeds) every such
+/// packet would be dropped. At 1400 (zeromasque's ceiling) ~1362B are
+/// writable. It is also the floor: DPLPMTUD may raise the size (up to 1452)
+/// but its black-hole detection never lowers it below this, because shrinking
+/// would silently stop the tunnel from carrying full-size inner packets. The
+/// client<->proxy path must therefore carry ~1450-byte IP packets; on a path
+/// that cannot, large packets are lost rather than the tunnel narrowing.
+const INITIAL_MTU: u16 = 1400;
 
 /// Size requested (per direction) for every UDP socket's kernel buffers.
 ///
@@ -161,19 +178,25 @@ fn transport_config(keepalive: bool, cc: CongestionControl) -> Arc<TransportConf
     // addresses) and noq schedules datagrams across them.
     t.max_concurrent_multipath_paths(MAX_PATHS);
     t.default_path_max_idle_timeout(Some(IDLE_TIMEOUT));
+    // Each path is abandoned after IDLE_TIMEOUT without receiving anything on
+    // it, so both ends must keep every path busy: ACKs for one path may travel
+    // on another (the lowest-numbered usable one), so a peer that only answers
+    // would leave the other side's extra paths silent, and they would time out
+    // and churn every ~10 s on an idle tunnel even though the links are fine.
+    t.default_path_keep_alive_interval(Some(KEEPALIVE));
     if keepalive {
         t.keep_alive_interval(Some(KEEPALIVE));
-        t.default_path_keep_alive_interval(Some(KEEPALIVE));
     }
     t.receive_window(VarInt::from_u32(10_000_000));
     t.stream_receive_window(VarInt::from_u32(2_000_000));
     t.max_concurrent_bidi_streams(VarInt::from_u32(128));
     t.max_concurrent_uni_streams(VarInt::from_u32(128));
-    // HTTP/3 datagrams ride on QUIC DATAGRAM frames. They cannot be fragmented,
-    // so a tunnelled packet must fit one QUIC packet: noq's DPLPMTUD (enabled by
-    // default, probing up to 1452 bytes) raises the usable size once the path
-    // allows it; oversize datagrams are dropped and warned about at the send
-    // sites.
+    // HTTP/3 datagrams ride on QUIC DATAGRAM frames, which cannot be
+    // fragmented, so a tunnelled packet must fit one QUIC packet. Start at
+    // INITIAL_MTU and never go below it; noq's DPLPMTUD (enabled by default,
+    // probing up to 1452 bytes) can raise it further.
+    t.initial_mtu(INITIAL_MTU);
+    t.min_mtu(INITIAL_MTU);
     t.datagram_receive_buffer_size(Some(DGRAM_RECV_BUFFER));
     t.datagram_send_buffer_size(DGRAM_SEND_BUFFER);
     Arc::new(t)
