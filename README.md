@@ -40,6 +40,22 @@ cargo build --release
 The first build compiles BoringSSL from source (via `boring-sys`, which needs
 `cmake` and Go), so it takes a few minutes.
 
+Prebuilt binaries are attached to each [GitHub release](https://github.com/losfair/rapidmasque/releases)
+(published by CI when a tag is pushed) for:
+
+| Platform | Archive |
+|---|---|
+| Linux amd64 (static, musl) | `rapidmasque-x86_64-unknown-linux-musl.tar.gz` |
+| Linux arm64 (static, musl) | `rapidmasque-aarch64-unknown-linux-musl.tar.gz` |
+| macOS arm64 | `rapidmasque-aarch64-apple-darwin.tar.gz` |
+| OpenBSD amd64 | `rapidmasque-x86_64-unknown-openbsd.tar.gz` |
+| OpenBSD arm64 | `rapidmasque-aarch64-unknown-openbsd.tar.gz` |
+
+The Linux binaries are fully static and run on any distribution. CI builds every
+target natively: Linux inside Alpine (`.github/scripts/build-musl.sh`), OpenBSD
+7.9 in a VM (`.github/scripts/build-openbsd.sh`); `SHA256SUMS` covers all
+archives.
+
 ## Model
 
 The forwarding **target is pinned on the server** — clients cannot choose a
