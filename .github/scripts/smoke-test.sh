@@ -168,10 +168,8 @@ if [ "$(uname -s)" = OpenBSD ]; then
         sudo tcpdump -n -l -i "$ifc" udp port 4433 > "$work/tcpdump-$ifc.txt" 2>&1 &
     done
     netstat -s -p udp > "$work/udpstat.before" 2>&1 || true
-    # The server's syscalls throughout, to catch the first failing send.
-    ktrace -t c -f "$work/server-all.ktrace" -p "$server_pid" || true
     spec="$egress_ip:4433/rtable=0"
-    for round in 1 2 3 4; do
+    for round in 1 2 3 4 5 6; do
         # The same extra path without a routing table first, to tell
         # multipath problems from routing-table ones.
         check "multipath-$round" 6005 --path "$egress_ip:4433"
