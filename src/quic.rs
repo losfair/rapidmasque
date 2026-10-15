@@ -256,11 +256,11 @@ pub const DEFAULT_DATAGRAM_QUEUE_TARGET: Duration = Duration::from_millis(5);
 /// Default CoDel interval (`--datagram-queue-interval-ms`): RFC 8289's 100 ms.
 ///
 /// The target, interval and hard limit are for paths with a round-trip time
-/// of up to this interval; on longer paths they are scaled up with the
-/// largest minimum RTT (`--datagram-queue-scale-with-rtt`), so that CoDel does
-/// not drop again before the tunnelled senders could react: on a 270 ms path
-/// a fixed 100 ms interval made tunnelled TCP retransmit ~6x as much, for no
-/// latency gain (testing/netem).
+/// of up to this interval; on longer paths they are always scaled up with the
+/// largest minimum RTT, so that CoDel does not drop again before the
+/// tunnelled senders could react: on a 270 ms path a fixed 100 ms interval
+/// made tunnelled TCP retransmit ~9x as much, for no latency gain
+/// (testing/netem).
 pub const DEFAULT_DATAGRAM_QUEUE_INTERVAL: Duration = Duration::from_millis(100);
 /// Default hard limit on datagram queueing delay (`--datagram-queue-max-ms`).
 ///
