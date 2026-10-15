@@ -84,6 +84,18 @@ show_logs() {
         [ -f "$cap" ] || continue
         echo "--- $(basename "$cap")"; tail -n 100 "$cap"
     done
+    if [ -f "$work/server-all.ktrace" ]; then
+        echo "--- server: failed syscalls since the multipath rounds began"
+        ktrace -C || true
+        kdump -f "$work/server-all.ktrace" > "$work/server-all.txt" 2>/dev/null || true
+        grep -E 'RET +[a-z_]+ -1' "$work/server-all.txt" | sort | uniq -c | sort -rn | head -n 20
+        echo "--- server: first failed sendmsg and what preceded it"
+        grep -n -m 1 -E 'RET +sendmsg -1' "$work/server-all.txt" | cut -d: -f1 | while read -r l; do
+            sed -n "$((l > 30 ? l - 30 : 1)),$((l + 10))p" "$work/server-all.txt"
+        done
+        echo "--- server: sendmsg calls per second"
+        grep -E 'CALL +sendmsg' "$work/server-all.txt" | wc -l
+    fi
     if [ -f "$work/udpstat.before" ]; then
         echo "--- UDP counters, before and now"
         cat "$work/udpstat.before"
@@ -156,6 +168,8 @@ if [ "$(uname -s)" = OpenBSD ]; then
         sudo tcpdump -n -l -i "$ifc" udp port 4433 > "$work/tcpdump-$ifc.txt" 2>&1 &
     done
     netstat -s -p udp > "$work/udpstat.before" 2>&1 || true
+    # The server's syscalls throughout, to catch the first failing send.
+    ktrace -t c -f "$work/server-all.ktrace" -p "$server_pid" || true
     spec="$egress_ip:4433/rtable=0"
     for round in 1 2 3 4; do
         # The same extra path without a routing table first, to tell
