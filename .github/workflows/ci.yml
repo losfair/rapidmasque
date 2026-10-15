@@ -180,7 +180,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.label }}
+          # v2: drop caches whose BoringSSL CMake state points at the old
+          # per-run temporary toolchain directory.
+          key: ${{ matrix.label }}-v2
 
       - name: Cross-build
         run: .github/scripts/cross-openbsd.sh ${{ matrix.arch }} out/rapidmasque

@@ -60,7 +60,14 @@ host=$(rustc +"$nightly" -vV | sed -n 's/^host: //p')
 rust_lld="$(rustc +"$nightly" --print sysroot)/lib/rustlib/$host/bin/gcc-ld/ld.lld"
 test -x "$rust_lld"
 
-tools="$(mktemp -d)"
+# Compiler wrappers and the CMake toolchain file live at a stable path inside
+# the target dir: BoringSSL's CMake cache records their paths, so a cached
+# target dir (CI) must not point at a vanished temporary directory.
+target_dir="${CARGO_TARGET_DIR:-$PWD/target}"
+mkdir -p "$target_dir"
+target_dir="$(cd "$target_dir" && pwd)"
+tools="$target_dir/cross-openbsd/$triple"
+mkdir -p "$tools"
 for tool in cc c++; do
     driver="$clang"
     [ "$tool" = c++ ] && driver="$clangxx"
@@ -97,10 +104,10 @@ export "CXXFLAGS_$lvar=-include $tools/openbsd-compat.h"
 export "BINDGEN_EXTRA_CLANG_ARGS_$lvar=--target=$triple --sysroot=$sysroot -include $tools/openbsd-compat.h"
 export "BORING_BSSL_RUST_CPPLIB_$lvar=c++"
 
-cargo +"$nightly" build --release --locked --target "$triple" \
+CARGO_TARGET_DIR="$target_dir" cargo +"$nightly" build --release --locked --target "$triple" \
     -Zbuild-std=std,panic_abort
 
-bin="${CARGO_TARGET_DIR:-target}/$triple/release/rapidmasque"
+bin="$target_dir/$triple/release/rapidmasque"
 file "$bin" 2>/dev/null || true
 mkdir -p "$(dirname "$out")"
 cp "$bin" "$out"
