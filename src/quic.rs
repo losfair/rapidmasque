@@ -40,6 +40,20 @@ pub(crate) const MAX_PATHS: u32 = 8;
 const DGRAM_SEND_BUFFER: usize = 4 * 1024 * 1024;
 const DGRAM_RECV_BUFFER: usize = 8 * 1024 * 1024;
 
+/// Initial outer (client<->proxy) QUIC packet size, i.e. UDP payload bytes.
+/// Sized so a full 1280-MTU inner datagram survives the trip from the very
+/// first packet: a 1280-byte IPv6 packet inside WireGuard is a 1312-byte UDP
+/// payload (16B header + 16B tag), plus our 2B HTTP-datagram prefix = 1314B
+/// that must fit in one QUIC DATAGRAM frame (which cannot be fragmented).
+/// noq's default of 1200 leaves only ~1162B, so until DPLPMTUD has probed the
+/// path upward (and indefinitely where probing never succeeds) every such
+/// packet would be dropped. At 1400 (zeromasque's ceiling) ~1362B are
+/// writable. The client<->proxy path must therefore carry ~1450-byte IP
+/// packets; DPLPMTUD can still raise the size to 1452, and its black-hole
+/// detection falls back toward 1200 on paths that cannot carry 1400 (inner
+/// packets that no longer fit are dropped and warned about at the send sites).
+const INITIAL_MTU: u16 = 1400;
+
 /// Size requested (per direction) for every UDP socket's kernel buffers.
 ///
 /// The whole tunnel is one QUIC connection; on a high-RTT path its
@@ -169,11 +183,11 @@ fn transport_config(keepalive: bool, cc: CongestionControl) -> Arc<TransportConf
     t.stream_receive_window(VarInt::from_u32(2_000_000));
     t.max_concurrent_bidi_streams(VarInt::from_u32(128));
     t.max_concurrent_uni_streams(VarInt::from_u32(128));
-    // HTTP/3 datagrams ride on QUIC DATAGRAM frames. They cannot be fragmented,
-    // so a tunnelled packet must fit one QUIC packet: noq's DPLPMTUD (enabled by
-    // default, probing up to 1452 bytes) raises the usable size once the path
-    // allows it; oversize datagrams are dropped and warned about at the send
-    // sites.
+    // HTTP/3 datagrams ride on QUIC DATAGRAM frames, which cannot be
+    // fragmented, so a tunnelled packet must fit one QUIC packet. Start at
+    // INITIAL_MTU; noq's DPLPMTUD (enabled by default, probing up to 1452
+    // bytes) can raise it further.
+    t.initial_mtu(INITIAL_MTU);
     t.datagram_receive_buffer_size(Some(DGRAM_RECV_BUFFER));
     t.datagram_send_buffer_size(DGRAM_SEND_BUFFER);
     Arc::new(t)

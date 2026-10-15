@@ -401,3 +401,37 @@ async fn no_congestion_control_never_limits_any_path() {
         );
     }
 }
+
+/// A WireGuard tunnel with MTU 1280 needs 1314-byte HTTP datagrams (1280-byte
+/// inner packet + 32 bytes of WireGuard framing + 2 bytes of flow/context
+/// prefix). That must fit from the first packet, not only once DPLPMTUD has
+/// probed the path.
+#[tokio::test(flavor = "multi_thread")]
+async fn wireguard_1280_fits_right_after_handshake() {
+    let fx = Fixture::new("mtu");
+    let server = fx.server(HOST);
+    let addr = server.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let _ = tx.send(conn.max_datagram_size());
+        conn.closed().await;
+    });
+    let client = client_endpoint(false);
+    let conn = client
+        .connect_with(fx.client_config(false), addr, HOST)
+        .unwrap()
+        .await
+        .unwrap();
+    const WIREGUARD_1280_DATAGRAM: usize = 1280 + 32 + 2;
+    let client_max = conn.max_datagram_size().unwrap();
+    assert!(
+        client_max >= WIREGUARD_1280_DATAGRAM,
+        "client datagram room {client_max} < {WIREGUARD_1280_DATAGRAM}"
+    );
+    let server_max = rx.await.unwrap().unwrap();
+    assert!(
+        server_max >= WIREGUARD_1280_DATAGRAM,
+        "server datagram room {server_max} < {WIREGUARD_1280_DATAGRAM}"
+    );
+}
