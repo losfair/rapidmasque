@@ -89,6 +89,12 @@ and documented in `README.md`.
   (`.github/scripts/smoke-test.sh`) exercises a real `rtable=0` path. OpenBSD
   has no dual-stack sockets: `quic::client_bind_socket` falls back to the
   primary's family there.
+- OpenBSD UDP send stall (fixed in the losfair/noq fork, losfair/noq#4): a
+  non-blocking UDP `sendmsg` there fails with EAGAIN when another thread is
+  sending on the same socket, and noq's tokio sender used to clear write
+  readiness on it and wait forever for a kqueue write event, silencing every
+  connection on the socket. It looked like a routing-table bug; the smoke
+  test's back-to-back multipath rounds reproduce it within a few rounds.
 - Outgoing datagram queue management (always on, no flags; `quic::DATAGRAM_CODEL`)
   is noq's `TransportConfig::datagram_send_codel` (CoDel plus a hard
   `max_delay`, in the losfair/noq fork): the queue that builds up is noq's
