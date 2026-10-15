@@ -29,8 +29,9 @@ pub(crate) const CAPSULE_PROTOCOL_TRUE: &str = "?1";
 /// Connection (and per-path) idle timeout: a dead path or peer is detected
 /// within this long.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Client keepalive cadence; keeps NAT mappings warm on every path and lets a
-/// dead path be detected quickly.
+/// Keepalive cadence. The client pings the connection and every path; the
+/// server pings every path too (see `transport_config`). Keeps NAT mappings
+/// warm and lets a dead path be detected quickly.
 const KEEPALIVE: Duration = Duration::from_secs(1);
 /// Upper bound on concurrently open multipath paths, per connection.
 pub(crate) const MAX_PATHS: u32 = 8;
@@ -175,9 +176,14 @@ fn transport_config(keepalive: bool, cc: CongestionControl) -> Arc<TransportConf
     // addresses) and noq schedules datagrams across them.
     t.max_concurrent_multipath_paths(MAX_PATHS);
     t.default_path_max_idle_timeout(Some(IDLE_TIMEOUT));
+    // Each path is abandoned after IDLE_TIMEOUT without receiving anything on
+    // it, so both ends must keep every path busy: ACKs for one path may travel
+    // on another (the lowest-numbered usable one), so a peer that only answers
+    // would leave the other side's extra paths silent, and they would time out
+    // and churn every ~10 s on an idle tunnel even though the links are fine.
+    t.default_path_keep_alive_interval(Some(KEEPALIVE));
     if keepalive {
         t.keep_alive_interval(Some(KEEPALIVE));
-        t.default_path_keep_alive_interval(Some(KEEPALIVE));
     }
     t.receive_window(VarInt::from_u32(10_000_000));
     t.stream_receive_window(VarInt::from_u32(2_000_000));

@@ -435,3 +435,62 @@ async fn wireguard_1280_fits_right_after_handshake() {
         "server datagram room {server_max} < {WIREGUARD_1280_DATAGRAM}"
     );
 }
+
+/// An idle extra path must survive the 10 s per-path idle timeout (both ends
+/// send per-path keepalives), and with several live paths a 1280-MTU
+/// WireGuard datagram must still fit (noq sizes datagrams for the smallest
+/// path MTU).
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_extra_path_stays_up_and_fits_wireguard() {
+    let fx = Fixture::new("mpidle");
+    let config = quic::build_server_config(
+        &fx.cert,
+        &fx.key,
+        None,
+        vec![HOST.to_string()],
+        CongestionControl::Bbr3,
+    )
+    .unwrap();
+    // Wildcard bind so the server answers on 127.0.0.2 too.
+    let socket = quic::bind_endpoint_socket("0.0.0.0:0".parse().unwrap()).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let server = Endpoint::new(
+        quic::endpoint_config(),
+        Some(config),
+        socket,
+        Arc::new(TokioRuntime),
+    )
+    .unwrap();
+    tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        conn.closed().await;
+    });
+
+    let primary: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let client = client_endpoint(true);
+    let conn = client
+        .connect_with(fx.client_config(false), primary, HOST)
+        .unwrap()
+        .await
+        .unwrap();
+    let extra: SocketAddr = format!("127.0.0.2:{port}").parse().unwrap();
+    let mut path = None;
+    for _ in 0..40 {
+        if let Ok(p) = conn.open_path_ensure(extra, PathStatus::Available).await {
+            path = Some(p);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let path = path.expect("extra path must open");
+
+    // Idle for longer than the path idle timeout.
+    tokio::time::sleep(Duration::from_secs(13)).await;
+    assert!(
+        path.status().is_ok(),
+        "idle extra path {} was abandoned",
+        path.id()
+    );
+    let room = conn.max_datagram_size().unwrap();
+    assert!(room >= 1280 + 32 + 2, "datagram room {room} with two paths");
+}
