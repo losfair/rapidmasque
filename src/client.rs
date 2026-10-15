@@ -1,0 +1,565 @@
+//! MASQUE CONNECT-UDP client (RFC 9298) over tokio + noq.
+//!
+//! Opens a QUIC/HTTP3 connection to the proxy and issues Extended CONNECT
+//! requests, tunnelling UDP payloads as HTTP datagrams. [`run_proxy`] binds a
+//! local UDP socket and acts as a UDP→CONNECT-UDP proxy, opening one flow per
+//! local source address and relaying both directions. Extra QUIC multipath
+//! paths (other local interfaces and/or proxy addresses) can be attached to the
+//! tunnel; noq then schedules datagrams across every live path.
+
+use std::collections::HashMap;
+use std::fmt;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow};
+use bytes::Bytes;
+use noq::{Connection, Endpoint, FourTuple, PathStatus, TokioRuntime};
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
+
+use crate::cc::CongestionControl;
+use crate::dgram;
+use crate::endpoint::Endpoint as ProxyEndpoint;
+use crate::h3::{self, FrameReader};
+use crate::quic::{self, CAPSULE_PROTOCOL_TRUE, Verify, send_datagram};
+use crate::tls::HandshakeData;
+use crate::util::{CHANNEL_CAP, RECV_BUF, hex};
+
+/// Per-source bound on datagrams buffered before the flow's request is
+/// answered.
+const MAX_PENDING: usize = 32;
+/// Reconnect backoff bounds. The client never gives up; it keeps redialing the
+/// proxy, backing off on repeated failures and resetting once a tunnel comes up.
+const RECONNECT_MIN: Duration = Duration::from_millis(100);
+const RECONNECT_MAX: Duration = Duration::from_secs(5);
+/// Re-open cadence for a configured multipath path that is down: starts at
+/// `PATH_RETRY_MIN`, backs off to `PATH_RETRY` (also the health-check period
+/// for a path that is up).
+const PATH_RETRY_MIN: Duration = Duration::from_millis(250);
+const PATH_RETRY: Duration = Duration::from_secs(5);
+/// Consecutive failures before a down path is reported at `warn`.
+const PATH_WARN_AFTER: u32 = 3;
+
+/// An extra multipath path: `REMOTE_IP:PORT[@LOCAL_IP][/backup]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathSpec {
+    pub remote: SocketAddr,
+    pub local_ip: Option<IpAddr>,
+    pub backup: bool,
+}
+
+impl FromStr for PathSpec {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        let (s, backup) = match s.strip_suffix("/backup") {
+            Some(rest) => (rest, true),
+            None => (s, false),
+        };
+        let (remote, local) = match s.rsplit_once('@') {
+            Some((r, l)) => (r, Some(l)),
+            None => (s, None),
+        };
+        let remote = remote
+            .parse()
+            .map_err(|e| format!("bad remote address {remote:?}: {e}"))?;
+        let local_ip = local
+            .map(|l| l.trim_matches(|c| c == '[' || c == ']').parse())
+            .transpose()
+            .map_err(|e| format!("bad local IP {:?}: {e}", local.unwrap_or_default()))?;
+        Ok(Self {
+            remote,
+            local_ip,
+            backup,
+        })
+    }
+}
+
+impl fmt::Display for PathSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.remote)?;
+        if let Some(ip) = self.local_ip {
+            write!(f, "@{ip}")?;
+        }
+        if self.backup {
+            write!(f, "/backup")?;
+        }
+        Ok(())
+    }
+}
+
+/// Connection parameters for the proxy client.
+pub struct ConnectParams {
+    pub endpoint: ProxyEndpoint,
+    /// Override for the proxy UDP address; the endpoint host is still used for
+    /// SNI / `:authority`.
+    pub proxy_addr: Option<SocketAddr>,
+    pub verify: Verify,
+    pub ech_config_list: Option<Vec<u8>>,
+    /// Extra multipath paths to attach once the tunnel is up.
+    pub paths: Vec<PathSpec>,
+    pub congestion_control: CongestionControl,
+}
+
+pub struct ProxyOptions {
+    pub conn: ConnectParams,
+    pub listen: SocketAddr,
+}
+
+type LocalPacket = (Bytes, SocketAddr);
+
+/// Run as a local UDP→CONNECT-UDP proxy. The local listen socket is bound once
+/// and persists; the QUIC connection to the proxy is (re)established in a loop
+/// that never gives up, so a server restart, a dropped NAT mapping, or any other
+/// failure recovers automatically. Flows reopen lazily as local datagrams
+/// arrive (apps retransmit lost UDP, so they self-heal).
+pub async fn run_proxy(opts: ProxyOptions) -> Result<()> {
+    let std_sock = std::net::UdpSocket::bind(opts.listen)
+        .with_context(|| format!("binding local UDP listen socket {}", opts.listen))?;
+    quic::enlarge_udp_buffers(&std_sock);
+    std_sock.set_nonblocking(true)?;
+    let lsock = Arc::new(UdpSocket::from_std(std_sock)?);
+    log::info!("local UDP proxy listening on {}", opts.listen);
+
+    // The local recv task persists across reconnects, buffering datagrams that
+    // arrive while the tunnel is briefly down.
+    let (ltx, mut lrx) = mpsc::channel::<LocalPacket>(CHANNEL_CAP);
+    tokio::spawn(local_recv(lsock.clone(), ltx));
+
+    let mut backoff = RECONNECT_MIN;
+    loop {
+        let established = run_session(&opts.conn, &lsock, &mut lrx).await;
+        if established {
+            backoff = RECONNECT_MIN;
+        }
+        log::warn!("tunnel down; reconnecting in {backoff:?}");
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(RECONNECT_MAX);
+    }
+}
+
+async fn local_recv(lsock: Arc<UdpSocket>, ltx: mpsc::Sender<LocalPacket>) {
+    let mut buf = vec![0u8; RECV_BUF];
+    loop {
+        match lsock.recv_from(&mut buf).await {
+            Ok((n, src)) => {
+                // Drop when full: datagrams are lossy by contract.
+                let _ = ltx.try_send((Bytes::copy_from_slice(&buf[..n]), src));
+            }
+            Err(e) => {
+                log::debug!("local recv: {e}");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+}
+
+/// A connected QUIC connection to the proxy (plus its endpoint, which must
+/// outlive it).
+struct Dialed {
+    endpoint: Endpoint,
+    conn: Connection,
+    proxy_addr: SocketAddr,
+}
+
+async fn dial(p: &ConnectParams) -> Result<Dialed> {
+    let config =
+        quic::build_client_config(&p.verify, p.ech_config_list.clone(), p.congestion_control)?;
+    let proxy_addr = match p.proxy_addr {
+        Some(addr) => addr,
+        None => resolve_authority(&p.endpoint.authority)?,
+    };
+    let server_name = host_of(&p.endpoint.authority);
+
+    let socket = quic::client_bind_socket(proxy_addr, !p.paths.is_empty())
+        .context("binding client UDP socket")?;
+    let endpoint = Endpoint::new(
+        quic::endpoint_config(),
+        None,
+        socket,
+        Arc::new(TokioRuntime),
+    )
+    .context("creating QUIC endpoint")?;
+
+    log::info!("connecting to proxy {proxy_addr} (sni={server_name})");
+    let conn = endpoint
+        .connect_with(config, proxy_addr, &server_name)
+        .map_err(|e| anyhow!("connect: {e}"))?
+        .await
+        .context("QUIC handshake")?;
+    Ok(Dialed {
+        endpoint,
+        conn,
+        proxy_addr,
+    })
+}
+
+/// One local source's flow state.
+struct FlowState {
+    /// Distinguishes this flow from earlier ones for the same source, so late
+    /// events from a closed flow are ignored.
+    token: u64,
+    /// Quarter-stream id, set once the request stream is open.
+    flow_id: Option<u64>,
+    /// Set once the proxy answers 2xx. Datagrams must not be sent before this:
+    /// the server only creates the flow when it processes the CONNECT request,
+    /// and a datagram can otherwise overtake the request and be dropped.
+    established: bool,
+    /// Datagrams buffered until the flow is established.
+    pending: Vec<Bytes>,
+}
+
+/// Progress reports from per-flow request tasks to the session loop.
+enum FlowEvent {
+    Opened {
+        src: SocketAddr,
+        token: u64,
+        flow_id: u64,
+    },
+    Accepted {
+        src: SocketAddr,
+        token: u64,
+    },
+    Closed {
+        src: SocketAddr,
+        token: u64,
+    },
+}
+
+/// Drive one connection lifetime to the proxy. Returns whether the tunnel became
+/// established (so the caller resets its backoff). Never propagates connection
+/// errors: on any failure it logs and returns so the caller reconnects.
+async fn run_session(
+    p: &ConnectParams,
+    lsock: &Arc<UdpSocket>,
+    lrx: &mut mpsc::Receiver<LocalPacket>,
+) -> bool {
+    let Dialed {
+        endpoint,
+        conn,
+        proxy_addr,
+    } = match dial(p).await {
+        Ok(d) => d,
+        Err(e) => {
+            log::warn!("dial failed: {e:#}");
+            return false;
+        }
+    };
+
+    if let Some(der) = conn
+        .peer_identity()
+        .and_then(|id| id.downcast::<Vec<u8>>().ok())
+    {
+        log::info!(
+            "proxy certificate sha256: {}",
+            hex(&boring::sha::sha256(&der))
+        );
+    }
+    let ech = conn
+        .handshake_data()
+        .and_then(|d| d.downcast::<HandshakeData>().ok())
+        .is_some_and(|h| h.ech_accepted);
+
+    // Our control stream must stay open for the connection's lifetime.
+    let _control = match h3::open_control(&conn).await {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("HTTP/3 setup failed: {e:#}");
+            return false;
+        }
+    };
+    tokio::spawn(h3::serve_uni_streams(conn.clone()));
+    tokio::spawn(quic::log_path_events(conn.clone()));
+    if !p.paths.is_empty() {
+        // Also keep the primary path: if it is abandoned (e.g. its uplink went
+        // away) while extra paths carry the tunnel, re-open it once it works.
+        let primary = PathSpec {
+            remote: proxy_addr,
+            local_ip: None,
+            backup: false,
+        };
+        for spec in std::iter::once(primary).chain(p.paths.iter().cloned()) {
+            tokio::spawn(maintain_path(conn.clone(), spec));
+        }
+    }
+    log::info!(
+        "tunnel established (ech={ech}, multipath={})",
+        conn.is_multipath_enabled()
+    );
+
+    let authority: Arc<str> = p.endpoint.authority.as_str().into();
+    let path: Arc<str> = p.endpoint.path.as_str().into();
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<FlowEvent>();
+    let mut by_addr: HashMap<SocketAddr, FlowState> = HashMap::new();
+    let mut flows: HashMap<u64, SocketAddr> = HashMap::new();
+    let mut next_token = 0u64;
+
+    let reason = loop {
+        tokio::select! {
+            local = lrx.recv() => {
+                let Some(first) = local else { break "local socket closed".to_string() };
+                // Absorb the whole queued burst in one wakeup.
+                let mut batch = vec![first];
+                while let Ok(pkt) = lrx.try_recv() {
+                    batch.push(pkt);
+                }
+                for (data, src) in batch {
+                    let st = by_addr.entry(src).or_insert_with(|| {
+                        next_token += 1;
+                        tokio::spawn(open_flow(
+                            conn.clone(),
+                            authority.clone(),
+                            path.clone(),
+                            src,
+                            next_token,
+                            ev_tx.clone(),
+                        ));
+                        FlowState {
+                            token: next_token,
+                            flow_id: None,
+                            established: false,
+                            pending: Vec::new(),
+                        }
+                    });
+                    match (st.established, st.flow_id) {
+                        (true, Some(fid)) => {
+                            log::debug!("-> tunnel flow {fid}: {} bytes", data.len());
+                            send_datagram(&conn, fid, dgram::encode(fid, &data).into(), "local");
+                        }
+                        _ => {
+                            if st.pending.len() < MAX_PENDING {
+                                st.pending.push(data);
+                            }
+                        }
+                    }
+                }
+            }
+            datagram = conn.read_datagram() => match datagram {
+                Ok(d) => route_tunnel_datagram(lsock, &flows, &d).await,
+                Err(e) => break e.to_string(),
+            },
+            Some(ev) = ev_rx.recv() => match ev {
+                FlowEvent::Opened { src, token, flow_id } => {
+                    if let Some(st) = by_addr.get_mut(&src).filter(|st| st.token == token) {
+                        st.flow_id = Some(flow_id);
+                        flows.insert(flow_id, src);
+                        log::info!("opened flow {flow_id} for local {src}");
+                    }
+                }
+                FlowEvent::Accepted { src, token } => {
+                    if let Some(st) = by_addr.get_mut(&src).filter(|st| st.token == token)
+                        && let Some(fid) = st.flow_id
+                    {
+                        // The server has created the flow; release buffered data.
+                        st.established = true;
+                        for data in std::mem::take(&mut st.pending) {
+                            send_datagram(&conn, fid, dgram::encode(fid, &data).into(), "local");
+                        }
+                    }
+                }
+                FlowEvent::Closed { src, token } => {
+                    if by_addr.get(&src).is_some_and(|st| st.token == token)
+                        && let Some(st) = by_addr.remove(&src)
+                        && let Some(fid) = st.flow_id
+                    {
+                        flows.remove(&fid);
+                    }
+                }
+            },
+        }
+    };
+    log::info!("tunnel closed: {reason}");
+    conn.close(0u32.into(), b"");
+    drop(endpoint);
+    true
+}
+
+/// Open one CONNECT-UDP request stream for local `src`, report its progress,
+/// and hold the stream open until the proxy finishes or resets it.
+async fn open_flow(
+    conn: Connection,
+    authority: Arc<str>,
+    path: Arc<str>,
+    src: SocketAddr,
+    token: u64,
+    events: mpsc::UnboundedSender<FlowEvent>,
+) {
+    let closed = |events: &mpsc::UnboundedSender<FlowEvent>| {
+        let _ = events.send(FlowEvent::Closed { src, token });
+    };
+    let (mut send, recv) = match conn.open_bi().await {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("opening flow for {src} failed: {e}");
+            return closed(&events);
+        }
+    };
+    let flow_id = u64::from(send.id()) / 4;
+    let _ = events.send(FlowEvent::Opened {
+        src,
+        token,
+        flow_id,
+    });
+
+    let request = h3::headers_frame(&[
+        (":method", "CONNECT"),
+        (":protocol", "connect-udp"),
+        (":scheme", "https"),
+        (":authority", &authority),
+        (":path", &path),
+        ("capsule-protocol", CAPSULE_PROTOCOL_TRUE),
+    ]);
+    if let Err(e) = send.write_all(&request).await {
+        log::warn!("send_request for {src} failed: {e}");
+        return closed(&events);
+    }
+
+    let mut reader = FrameReader::new(recv);
+    loop {
+        match reader.read_headers().await {
+            Ok(Some(fields)) => match h3::status_of(&fields) {
+                Some(s) if (100..200).contains(&s) => continue, // interim
+                Some(s) if (200..300).contains(&s) => {
+                    log::debug!("flow {flow_id} accepted (status {s})");
+                    let _ = events.send(FlowEvent::Accepted { src, token });
+                    break;
+                }
+                status => {
+                    log::warn!("flow {flow_id} rejected (status {status:?})");
+                    return closed(&events);
+                }
+            },
+            Ok(None) => return closed(&events),
+            Err(e) => {
+                log::debug!("flow {flow_id} response: {e:#}");
+                return closed(&events);
+            }
+        }
+    }
+
+    // Ends when the proxy closes or resets the flow (e.g. idle timeout) or the
+    // connection goes away.
+    let _ = reader.drain().await;
+    log::debug!("flow {flow_id} closed");
+    closed(&events);
+    drop(send);
+}
+
+/// Forward a tunnelled datagram back to the local source for its flow.
+async fn route_tunnel_datagram(lsock: &UdpSocket, flows: &HashMap<u64, SocketAddr>, d: &[u8]) {
+    let Some(p) = dgram::decode(d) else {
+        return;
+    };
+    if p.context_id != dgram::CONTEXT_ID_UDP {
+        return;
+    }
+    if let Some(src) = flows.get(&p.flow_id)
+        && let Err(e) = lsock.send_to(p.payload, *src).await
+    {
+        log::debug!("send to local {src} failed: {e}");
+    }
+}
+
+/// Keep one configured multipath path open for the connection's lifetime,
+/// re-opening it whenever it fails or is abandoned.
+async fn maintain_path(conn: Connection, spec: PathSpec) {
+    if !conn.is_multipath_enabled() {
+        log::warn!("proxy did not negotiate QUIC multipath; not opening path {spec}");
+        return;
+    }
+    let status = if spec.backup {
+        PathStatus::Backup
+    } else {
+        PathStatus::Available
+    };
+    // Right after the handshake the proxy may not have issued connection IDs
+    // for new paths yet, so retry quickly at first and back off to PATH_RETRY.
+    // Log only on state changes, and warn only once a path keeps failing.
+    let mut delay = PATH_RETRY_MIN;
+    let mut up: Option<noq::PathId> = None;
+    let mut failures = 0u32;
+    while conn.close_reason().is_none() {
+        let tuple = FourTuple::new(spec.remote, spec.local_ip);
+        match conn.open_path_ensure(tuple, status).await {
+            Ok(path) => {
+                if up != Some(path.id()) {
+                    log::info!("multipath path {spec} up (path id {})", path.id());
+                    up = Some(path.id());
+                }
+                failures = 0;
+                delay = PATH_RETRY_MIN;
+            }
+            Err(e) => {
+                if up.take().is_some() {
+                    log::warn!("multipath path {spec} lost: {e}");
+                }
+                failures += 1;
+                if failures == PATH_WARN_AFTER {
+                    log::warn!(
+                        "multipath path {spec} unavailable: {e}; retrying every {PATH_RETRY:?}"
+                    );
+                } else {
+                    log::debug!("multipath path {spec}: {e}");
+                }
+                delay = (delay * 2).min(PATH_RETRY);
+            }
+        }
+        tokio::time::sleep(if up.is_some() { PATH_RETRY } else { delay }).await;
+    }
+}
+
+fn host_of(authority: &str) -> String {
+    // Strip the optional :port; handle bracketed IPv6 literals.
+    if let Some(rest) = authority.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        return rest[..end].to_string();
+    }
+    authority
+        .rsplit_once(':')
+        .map(|(h, _)| h.to_string())
+        .unwrap_or_else(|| authority.to_string())
+}
+
+fn resolve_authority(authority: &str) -> Result<SocketAddr> {
+    authority
+        .to_socket_addrs()
+        .with_context(|| format!("resolving proxy authority {authority}"))?
+        .next()
+        .ok_or_else(|| anyhow!("no addresses for proxy authority {authority}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_of_strips_port_and_brackets() {
+        assert_eq!(host_of("localhost:4433"), "localhost");
+        assert_eq!(host_of("example.com"), "example.com");
+        assert_eq!(host_of("[2001:db8::1]:443"), "2001:db8::1");
+    }
+
+    #[test]
+    fn path_spec_parsing() {
+        let p: PathSpec = "192.0.2.1:4433".parse().unwrap();
+        assert_eq!(p.remote, "192.0.2.1:4433".parse().unwrap());
+        assert_eq!(p.local_ip, None);
+        assert!(!p.backup);
+
+        let p: PathSpec = "192.0.2.1:4433@10.0.0.5/backup".parse().unwrap();
+        assert_eq!(p.local_ip, Some("10.0.0.5".parse().unwrap()));
+        assert!(p.backup);
+        assert_eq!(p.to_string(), "192.0.2.1:4433@10.0.0.5/backup");
+
+        let p: PathSpec = "[2001:db8::1]:443@[fe80::1]".parse().unwrap();
+        assert_eq!(p.remote, "[2001:db8::1]:443".parse().unwrap());
+        assert_eq!(p.local_ip, Some("fe80::1".parse().unwrap()));
+
+        assert!("nonsense".parse::<PathSpec>().is_err());
+        assert!("192.0.2.1:4433@not-an-ip".parse::<PathSpec>().is_err());
+    }
+}

@@ -1,0 +1,296 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["*"]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: build, lint & unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build prerequisites (BoringSSL needs cmake + Go)
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --all-targets
+
+      - name: Unit + in-process end-to-end tests
+        run: cargo test
+
+  interop:
+    name: masque-go interop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: rapidmasque
+
+      - name: Check out masque-go (reference implementation)
+        uses: actions/checkout@v4
+        with:
+          repository: quic-go/masque-go
+          path: masque-go
+
+      - name: Install build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rapidmasque
+
+      - name: Run interop matrix
+        working-directory: rapidmasque
+        env:
+          MASQUE_GO: ${{ github.workspace }}/masque-go
+        run: ./testing/interop.sh
+
+  # Release binaries. Built on every push/PR so a breakage on any platform
+  # shows up before tagging; published as a GitHub release on tags.
+  build-linux-musl:
+    name: build (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - label: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      # Native build inside Alpine (no cross-compiling): a fully static binary.
+      - name: Build static binary (Alpine)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src alpine:3.23 \
+            .github/scripts/build-musl.sh "out/rapidmasque"
+          sudo chown -R "$(id -u):$(id -g)" out
+
+      - name: Package
+        run: .github/scripts/package.sh out/rapidmasque ${{ matrix.label }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rapidmasque-${{ matrix.label }}
+          path: dist/*
+
+  build-darwin:
+    name: build (aarch64-apple-darwin)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          ./target/release/rapidmasque --version
+          .github/scripts/package.sh target/release/rapidmasque aarch64-apple-darwin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rapidmasque-aarch64-apple-darwin
+          path: dist/*
+
+  # OpenBSD is cross-built on Linux (`.github/scripts/cross-openbsd.sh`):
+  # nightly -Zbuild-std + the official OpenBSD sysroot + clang/lld. VMs then
+  # run the result (test-openbsd*); compiling inside an emulated arm64 VM
+  # would take hours.
+  build-openbsd:
+    name: build (${{ matrix.label }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: x86_64-unknown-openbsd
+            arch: amd64
+          - label: aarch64-unknown-openbsd
+            arch: arm64
+    env:
+      OPENBSD_VERSION: "7.9"
+      RUST_NIGHTLY: nightly-2026-10-15
+      # LLVM < 22 crashes on stack-protector code for aarch64-unknown-openbsd.
+      CLANG: clang-22
+      CLANGXX: clang++-22
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang 22 (apt.llvm.org)
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-22.list
+          sudo apt-get update
+          sudo apt-get install -y clang-22 cmake
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Cache OpenBSD sysroot
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/openbsd-sysroot
+          key: openbsd-sysroot-${{ env.OPENBSD_VERSION }}-${{ matrix.arch }}-v1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.label }}
+
+      - name: Cross-build
+        run: .github/scripts/cross-openbsd.sh ${{ matrix.arch }} out/rapidmasque
+
+      - name: Build smoke-test helpers for OpenBSD
+        env:
+          GOOS: openbsd
+          GOARCH: ${{ matrix.arch }}
+          GO111MODULE: "off"
+        run: |
+          for t in udpecho udpsend gencert; do
+            go build -o "out/tools/$t" "testing/$t.go"
+          done
+
+      - name: Package
+        run: .github/scripts/package.sh out/rapidmasque ${{ matrix.label }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rapidmasque-${{ matrix.label }}
+          path: dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smoke-${{ matrix.label }}
+          path: out/
+
+  # Run the cross-built binaries on OpenBSD. cross-platform-actions ships an
+  # x86-64-only QEMU, so both VMs run on x86-64 runners: amd64 is
+  # KVM-accelerated and gates the release; arm64 is fully emulated (slow), so
+  # it runs on every push/PR but releases do not wait for it.
+  test-openbsd:
+    name: run on OpenBSD (x86_64-unknown-openbsd)
+    needs: build-openbsd
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: smoke-x86_64-unknown-openbsd
+          path: out
+
+      - name: Start OpenBSD VM
+        uses: cross-platform-actions/action@v1.6.0
+        with:
+          operating_system: openbsd
+          architecture: x86-64
+          version: "7.9"
+          memory: 4G
+          cpu_count: 4
+
+      - name: Smoke test (inside the VM)
+        shell: cpa.sh {0}
+        run: |
+          chmod +x out/rapidmasque out/tools/*
+          .github/scripts/smoke-test.sh out/rapidmasque out/tools
+
+  test-openbsd-arm64:
+    name: run on OpenBSD (aarch64-unknown-openbsd, emulated)
+    needs: build-openbsd
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: smoke-aarch64-unknown-openbsd
+          path: out
+
+      - name: Start OpenBSD VM
+        uses: cross-platform-actions/action@v1.6.0
+        with:
+          operating_system: openbsd
+          architecture: arm64
+          version: "7.9"
+          memory: 4G
+          cpu_count: 4
+
+      - name: Smoke test (inside the VM)
+        shell: cpa.sh {0}
+        run: |
+          chmod +x out/rapidmasque out/tools/*
+          .github/scripts/smoke-test.sh out/rapidmasque out/tools
+
+  release:
+    name: publish GitHub release
+    if: github.ref_type == 'tag'
+    needs: [build-test, interop, build-linux-musl, build-darwin, build-openbsd, test-openbsd]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: rapidmasque-*
+          merge-multiple: true
+
+      - name: Combined checksums
+        run: cat dist/*.sha256 | tee dist/SHA256SUMS
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true
