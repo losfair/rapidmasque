@@ -57,7 +57,7 @@ pub(crate) const WIREGUARD_1280_DATAGRAM: usize = 1280 + 32 + 2;
 /// that issues longer CIDs (up to 20 bytes) the room shrinks accordingly.
 const DATAGRAM_OVERHEAD: usize = 1 + 8 + 4 + 16 + 9;
 
-/// Initial and minimum outer (client<->proxy) QUIC packet size, i.e. UDP
+/// Default initial and minimum outer (client<->proxy) QUIC packet size, i.e. UDP
 /// payload bytes: exactly what a 1280-MTU WireGuard packet needs (1352).
 /// noq's default of 1200 leaves only 1162B, so until DPLPMTUD had probed the
 /// path upward (and indefinitely where probing never succeeds) every
@@ -66,9 +66,9 @@ const DATAGRAM_OVERHEAD: usize = 1 + 8 + 4 + 16 + 9;
 /// this, because shrinking would silently stop the tunnel from carrying
 /// full-size inner packets. The client<->proxy path must therefore carry
 /// 1380-byte IPv4 / 1400-byte IPv6 packets; on a path that cannot, large
-/// packets are lost rather than the tunnel narrowing.
-const INITIAL_MTU: u16 = (WIREGUARD_1280_DATAGRAM + DATAGRAM_OVERHEAD) as u16;
-const _: () = assert!(INITIAL_MTU == 1352);
+/// packets are lost rather than the tunnel narrowing. Override with `--min-mtu`.
+pub(crate) const DEFAULT_MIN_MTU: u16 = (WIREGUARD_1280_DATAGRAM + DATAGRAM_OVERHEAD) as u16;
+const _: () = assert!(DEFAULT_MIN_MTU == 1352);
 
 /// Size requested (per direction) for every UDP socket's kernel buffers.
 ///
@@ -216,6 +216,8 @@ pub(crate) fn endpoint_config() -> EndpointConfig {
 /// Transport settings chosen on the command line, shared by client and server.
 #[derive(Debug, Clone, Copy)]
 pub struct TransportOptions {
+    /// Initial and minimum outer QUIC packet size in UDP payload bytes.
+    pub min_mtu: u16,
     /// Outer congestion control for what this side sends.
     pub congestion_control: CongestionControl,
     /// BBRv3 initial congestion window in bytes, per path.
@@ -232,6 +234,7 @@ pub struct TransportOptions {
 impl Default for TransportOptions {
     fn default() -> Self {
         Self {
+            min_mtu: DEFAULT_MIN_MTU,
             congestion_control: CongestionControl::Bbr3,
             bbr3_initial_window: DEFAULT_BBR3_INITIAL_WINDOW,
             path_spill_threshold: Some(DEFAULT_PATH_SPILL_THRESHOLD),
@@ -332,10 +335,10 @@ fn transport_config(keepalive: bool, opts: TransportOptions) -> Arc<TransportCon
     t.max_concurrent_uni_streams(VarInt::from_u32(128));
     // HTTP/3 datagrams ride on QUIC DATAGRAM frames, which cannot be
     // fragmented, so a tunnelled packet must fit one QUIC packet. Start at
-    // INITIAL_MTU and never go below it; noq's DPLPMTUD (enabled by default,
-    // probing up to 1452 bytes) can raise it further.
-    t.initial_mtu(INITIAL_MTU);
-    t.min_mtu(INITIAL_MTU);
+    // the configured minimum and never go below it; noq's DPLPMTUD
+    // (enabled by default, probing up to 1452 bytes) can raise it further.
+    t.initial_mtu(opts.min_mtu);
+    t.min_mtu(opts.min_mtu);
     t.datagram_receive_buffer_size(Some(DGRAM_RECV_BUFFER));
     t.datagram_send_buffer_size(DGRAM_SEND_BUFFER);
     t.datagram_send_codel(opts.datagram_codel);

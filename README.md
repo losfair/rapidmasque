@@ -587,7 +587,7 @@ sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216
 Measured over an emulated 270 ms RTT path, this takes a 2000 pkt/s
 (~19 Mbit/s) flow from ~40–60 % loss (erratic) to a stable ~3 %. Also keep the
 tunnelled interface's MTU low enough that an inner packet plus encapsulation
-fits one QUIC DATAGRAM (these cannot fragment). QUIC packets start at exactly
+fits one QUIC DATAGRAM (these cannot fragment). By default, QUIC packets start at exactly
 1352 bytes of UDP payload, which leaves the 1314 bytes of datagram room that a
 1280-MTU inner tunnel such as WireGuard needs from the first packet; DPLPMTUD
 can raise this to 1452 bytes, but it never drops below 1352 (black-hole
@@ -597,6 +597,14 @@ packets are lost rather than the tunnel quietly narrowing below what a
 1280-MTU inner tunnel needs. (The 1314 bytes assume the 8-byte connection IDs
 rapidmasque peers use; against a server issuing longer CIDs there is less
 room.)
+
+Use `--min-mtu BYTES` on `serve` and/or `client` to override the initial and
+minimum QUIC packet size for what that side sends (default 1352, minimum
+1200). The value counts UDP payload bytes, excluding IP and UDP headers.
+For example, `--min-mtu 1200` supports smaller outer paths, but may require
+a smaller tunnelled interface MTU until discovery finds more room. Discovery
+can raise the packet size; black-hole detection never lowers it below the
+configured minimum.
 
 BBRv3 (the default) paces and models the bottleneck. With
 `--congestion-control none`, bursts go out unpaced as fast as the socket accepts

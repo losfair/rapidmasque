@@ -8,7 +8,8 @@ use clap::{Args, Parser, Subcommand};
 use crate::cc::CongestionControl;
 use crate::client::PathSpec;
 use crate::quic::{
-    DATAGRAM_CODEL, DEFAULT_BBR3_INITIAL_WINDOW, DEFAULT_PATH_SPILL_THRESHOLD, TransportOptions,
+    DATAGRAM_CODEL, DEFAULT_BBR3_INITIAL_WINDOW, DEFAULT_MIN_MTU, DEFAULT_PATH_SPILL_THRESHOLD,
+    TransportOptions,
 };
 use crate::ranking::PathRanking;
 
@@ -159,6 +160,12 @@ pub struct ClientArgs {
 /// `client`.
 #[derive(Args, Debug)]
 pub struct TransportArgs {
+    /// Initial and minimum outer QUIC packet size in UDP payload bytes
+    /// (excluding IP/UDP headers). At least 1200. MTU discovery may raise
+    /// this, but black-hole detection never lowers it below this value.
+    #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_MIN_MTU, value_parser = clap::value_parser!(u16).range(1200..))]
+    pub min_mtu: u16,
+
     /// Congestion control for what this side sends. `bbr3` (default) runs
     /// BBRv3 per path; `none` never holds datagrams back, leaving rate control
     /// to the tunnelled protocol (e.g. TCP inside WireGuard) to avoid double
@@ -194,6 +201,7 @@ impl TransportArgs {
             bail!("--bbr3-initial-window needs --congestion-control bbr3");
         }
         Ok(TransportOptions {
+            min_mtu: self.min_mtu,
             congestion_control: self.congestion_control,
             bbr3_initial_window: self
                 .bbr3_initial_window
