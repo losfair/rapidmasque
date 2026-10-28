@@ -159,6 +159,67 @@ async fn ech_accepted_over_quic() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn missing_sni_is_accepted_with_ip_certificate() {
+    let fx = Fixture::new("no-sni");
+    // The SNI allowlist must not reject a client that sends no SNI at all.
+    let server = fx.server(HOST);
+    let addr = server.local_addr().unwrap();
+    let accept = tokio::spawn(async move {
+        for _ in 0..2 {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            assert_eq!(handshake_data(&conn).server_name, None);
+            conn.closed().await;
+        }
+    });
+
+    let client = client_endpoint(false);
+    for ip in ["127.0.0.1", "::1"] {
+        // Production ClientTls omits SNI for IP literals and verifies IP SANs.
+        let conn = tokio::time::timeout(
+            Duration::from_secs(5),
+            client
+                .connect_with(fx.client_config(false), addr, ip)
+                .unwrap(),
+        )
+        .await
+        .expect("IP-literal handshake must not time out")
+        .expect("IP-literal handshake without SNI must succeed");
+        conn.close(0u32.into(), b"");
+    }
+    accept.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_sni_does_not_bypass_certificate_verification() {
+    let fx = Fixture::new("no-sni-verify");
+    let server = fx.server(HOST);
+    let addr = server.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Some(incoming) = server.accept().await {
+            let _ = incoming.await;
+        }
+    });
+
+    let other = Fixture::new("no-sni-verify-other");
+    let client = client_endpoint(false);
+    for (config, ip) in [
+        (fx.client_config(false), "127.0.0.2"),
+        (other.client_config(false), "127.0.0.1"),
+    ] {
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.connect_with(config, addr, ip).unwrap(),
+        )
+        .await
+        .expect("certificate rejection must not time out");
+        assert!(
+            res.is_err(),
+            "a mismatched IP SAN or untrusted certificate must still fail"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn unmatched_sni_is_rejected() {
     let fx = Fixture::new("sni");
     let server = fx.server("other.internal");

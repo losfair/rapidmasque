@@ -139,6 +139,8 @@ pub(crate) fn self_signed() -> (
     let san = SubjectAlternativeName::new()
         .dns("secret.internal")
         .dns("public.example.com")
+        .ip("127.0.0.1")
+        .ip("::1")
         .build(&b.x509v3_context(None, None))
         .unwrap();
     b.append_extension(san).unwrap();

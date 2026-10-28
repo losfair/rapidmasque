@@ -71,11 +71,14 @@ CLANG=clang-22 CLANGXX=clang++-22 .github/scripts/cross-openbsd.sh arm64 out/rap
 The forwarding **target is pinned on the server** — clients cannot choose a
 destination. The server loads a **rule table** mapping endpoints to targets, and
 the rule authorities also define the allowed TLS SNI hostnames. Connections with
-missing or non-matching SNI are rejected during the TLS handshake; accepted
-CONNECT-UDP requests are then matched on `:authority` + path (the query string
-is ignored, so generic MASQUE clients that carry `target_host`/`target_port` in
-the query still interoperate; the server ignores those and uses the rule's
-target).
+non-matching SNI are rejected during the TLS handshake. Connections without SNI
+are accepted, so IP-literal endpoints can use certificates with IP subject
+alternative names (including Let's Encrypt IP certificates). Clients still verify
+the certificate against the endpoint's IP address; no `--insecure` is needed.
+All CONNECT-UDP requests, with or without SNI, are matched on `:authority` + path
+(the query string is ignored, so generic MASQUE clients that carry
+`target_host`/`target_port` in the query still interoperate; the server ignores
+those and uses the rule's target).
 
 The **client is a local UDP proxy**: it binds a UDP socket and tunnels every
 datagram received there through the proxy, opening one CONNECT-UDP flow per local
@@ -491,19 +494,19 @@ cleartext cover identity; it only needs a valid certificate for the ECH
 with the server's fresh `retry_configs`. A cert covering both names handles both
 paths.
 
-The server rejects ClientHellos whose SNI does not match any configured rule
-authority host. With ECH accepted, this check is applied to the decrypted inner
-SNI; rejected ECH fallbacks and ordinary non-ECH handshakes are checked against
-the cleartext SNI.
+The server rejects ClientHellos whose SNI is present but does not match any
+configured rule authority host. Missing SNI is allowed for IP-literal endpoints.
+With ECH accepted, this check is applied to the decrypted inner SNI; rejected ECH
+fallbacks and ordinary non-ECH handshakes are checked against the cleartext SNI.
 
 Both ends log whether ECH was accepted on each connection (`ech=true`).
 
 ### Access control
 
 By default the proxy performs **no client authentication**: any peer that can
-reach it, complete TLS with a configured SNI host, and send a CONNECT-UDP request
-matching a rule's authority + path is granted a tunnel. (The client still
-authenticates the *server* via TLS unless `--insecure`.)
+reach it, complete TLS (with a configured SNI host or no SNI), and send a
+CONNECT-UDP request matching a rule's authority + path is granted a tunnel. (The
+client still authenticates the *server* via TLS unless `--insecure`.)
 
 A secret can be embedded in a rule's endpoint **path** as a lightweight
 shared-secret gate. The server matches on the path component (the query string is
