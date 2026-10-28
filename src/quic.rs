@@ -373,14 +373,14 @@ pub(crate) fn install_ech_keys(builder: &mut SslContextBuilder, ech: &EchKeySet)
     Ok(())
 }
 
-/// Reject handshakes whose ClientHello SNI is missing or not one of the
-/// configured proxy endpoint hosts. With ECH accepted, BoringSSL exposes the
-/// protected inner SNI here; without ECH this checks the ordinary SNI.
+/// Reject handshakes whose ClientHello SNI is present but not one of the
+/// configured proxy endpoint hosts. Clients connecting to an IP literal omit
+/// SNI and authenticate the server using its certificate's IP SAN instead.
+/// With ECH accepted, BoringSSL exposes the protected inner SNI here.
 pub(crate) fn install_sni_guard(builder: &mut SslContextBuilder, allowed_hosts: Vec<String>) {
     builder.set_select_certificate_callback(move |client_hello| {
         let Some(sni) = client_hello.servername(NameType::HOST_NAME) else {
-            log::debug!("rejecting TLS ClientHello without SNI");
-            return Err(SelectCertError::ERROR);
+            return Ok(());
         };
         if allowed_hosts.iter().any(|h| h.eq_ignore_ascii_case(sni)) {
             return Ok(());
