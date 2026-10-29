@@ -31,7 +31,9 @@ permissions:
 jobs:
   netem:
     name: netem testbed
-    runs-on: ubuntu-latest
+    # Keep the benchmark on the known-working runner. Ubuntu 26.04's wg
+    # AppArmor profile denies reading the testbed's temporary private keys.
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
